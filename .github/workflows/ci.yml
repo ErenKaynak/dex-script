@@ -75,4 +75,7 @@ jobs:
       - name: uninstall
         run: |
           & "$env:LOCALAPPDATA\dex\bin\dex.cmd" uninstall
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep -Seconds 6
           if (Test-Path "$env:LOCALAPPDATA\dex") { Write-Error "not removed"; exit 1 }
+          exit 0

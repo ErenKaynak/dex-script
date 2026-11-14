@@ -14,14 +14,26 @@ be snapped, resized and multitasked like on a real desktop.
 **Linux / macOS**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ErenKaynak/dex-script/main/install.sh | bash
+curl -fsSL https://dex.erenkaynak.tr/linux | bash
 ```
 
 **Windows 10 / 11** (PowerShell)
 
 ```powershell
+irm https://dex.erenkaynak.tr/windows | iex
+```
+
+<details><summary>Direct GitHub links (if the short links are blocked)</summary>
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ErenKaynak/dex-script/main/install.sh | bash
+```
+
+```powershell
 irm https://raw.githubusercontent.com/ErenKaynak/dex-script/main/install.ps1 | iex
 ```
+
+</details>
 
 No sudo / admin, no package manager. Everything goes in your user folder, so it also works on
 locked-down school PCs that reset on reboot. Just re-run the one-liner, it takes a few seconds.

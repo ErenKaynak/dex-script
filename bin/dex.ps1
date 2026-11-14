@@ -123,10 +123,11 @@ try {
         $bundledAdb = Join-Path $root 'scrcpy/adb.exe'
         if (Test-Path $bundledAdb) { $ErrorActionPreference = 'Continue'; & $bundledAdb kill-server 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
         # Remove only what dex created; DEX_HOME may point at a shared folder.
-        foreach ($owned in @((Join-Path $root 'scrcpy'), $bin)) {
-            if (Test-Path $owned) { Remove-Item -LiteralPath $owned -Recurse -Force }
-        }
-        if ((Test-Path $root) -and !(Get-ChildItem -LiteralPath $root -Force)) { Remove-Item -LiteralPath $root -Force }
+        $scrcpyDir = Join-Path $root 'scrcpy'
+        if (Test-Path $scrcpyDir) { Remove-Item -LiteralPath $scrcpyDir -Recurse -Force }
+        # bin holds the running dex.cmd; cmd re-reads it after we exit, so delete it a moment later.
+        $cleanup = 'ping -n 3 127.0.0.1 >nul & rmdir /s /q "' + $bin + '" & rmdir "' + $root + '"'
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList @('/c', $cleanup) -WindowStyle Hidden
         if (Test-Path (Split-Path $configFile)) { Remove-Item -LiteralPath (Split-Path $configFile) -Recurse -Force }
         Write-Host 'Galaxy DeX uninstalled.'; exit 0
     }
