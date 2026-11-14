@@ -56,13 +56,14 @@ jobs:
     runs-on: windows-latest
     env:
       DEX_SOURCE_DIR: ${{ github.workspace }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
       - name: install (piped, like the one-liner)
-        shell: ${{ matrix.shell }}
         run: Get-Content -Raw install.ps1 | Invoke-Expression
       - name: smoke test
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:LOCALAPPDATA\dex\scrcpy\scrcpy.exe" --version
           & "$env:LOCALAPPDATA\dex\bin\dex.cmd" help
@@ -72,7 +73,6 @@ jobs:
           if ($LASTEXITCODE -ne 2) { exit 1 }
           exit 0
       - name: uninstall
-        shell: ${{ matrix.shell }}
         run: |
           & "$env:LOCALAPPDATA\dex\bin\dex.cmd" uninstall
           if (Test-Path "$env:LOCALAPPDATA\dex") { Write-Error "not removed"; exit 1 }
