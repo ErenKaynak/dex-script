@@ -30,7 +30,10 @@ try {
         try {
             $zip = Join-Path $temp $asset
             Invoke-WebRequest -UseBasicParsing "$release/$asset" -OutFile $zip
-            $sums = (Invoke-WebRequest -UseBasicParsing "$release/SHA256SUMS.txt").Content
+            # Saved to a file: GitHub serves it as octet-stream, so .Content would be a byte[].
+            $sumsFile = Join-Path $temp 'SHA256SUMS.txt'
+            Invoke-WebRequest -UseBasicParsing "$release/SHA256SUMS.txt" -OutFile $sumsFile
+            $sums = Get-Content -LiteralPath $sumsFile -Raw
             $expected = $null
             foreach ($line in ($sums -split "`n")) {
                 if ($line.Trim() -match '^([a-fA-F0-9]{64})\s+\*?(.+)$' -and $Matches[2] -eq $asset) { $expected = $Matches[1] }
