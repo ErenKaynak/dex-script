@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# dex - Samsung DeX in a resizable window on your PC (scrcpy virtual display).
+# Linux / macOS, bash 3.2 compatible, no sudo.
+set -euo pipefail
+
+DEX_REPO="${DEX_REPO:-ErenKaynak/dex-script}"
+ROOT="${DEX_HOME:-$HOME/.local/share/dex}"
+SCRCPY="$ROOT/scrcpy/scrcpy"
+ADB="${DEX_ADB:-$ROOT/scrcpy/adb}"
+CONFIG_DIR="${DEX_CONFIG_DIR:-$HOME/.config/dex}"
+CONFIG="$CONFIG_DIR/config"
+OS="$(uname -s)"
+
+if [ -t 1 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_ERR=""; C_B=""; C_OFF=""
+fi
+say() { printf '%s\n' "$*"; }
+ok() { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%s! %s%s\n' "$C_WARN" "$*" "$C_OFF"; }
+err() { printf '%s✗ %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+${C_B}dex${C_OFF} - Samsung DeX in a window on your PC
+
+Usage: dex [command] [options] [-- extra scrcpy args]
+
+Commands:
+  dex, dex code      start DeX, profile "code" (default)
+  dex school         start DeX, profile "school" (denser, for Word/Excel)
+  dex movie          start DeX, profile "movie" (high bitrate, H.265)
+  dex mirror         plain phone-screen mirror (no virtual display)
+  dex pair           wireless pairing without a cable
+  dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
+  dex wifi           switch a USB-connected phone to Wi-Fi
+  dex keyboard       open phone keyboard settings (pick Turkish Q)
+  dex doctor         show versions, devices and phone info
+  dex update         re-run the installer (latest scripts)
+  dex uninstall      remove everything dex installed
+  dex help           this text
+
+Options (start commands):
+  --res WxH      initial window size (default: 80% of your screen)
+  --dpi N        DeX density (code 160, school 140, movie 160)
+  --usb          force USB device
+  --wifi         force Wi-Fi device
+  --screen-off   turn the phone panel off while running
+  --fullscreen   start fullscreen
+  --             pass everything after it to scrcpy
+
+Config: $CONFIG
+  (DEX_SHORTCUT_MOD, DEX_DPI, DEX_RES, DEX_EXTRA_ARGS, DEX_LAST_ENDPOINT)
+EOF
+}
+
+# --- config -------------------------------------------------------------------
+cfg_get() { # cfg_get KEY
+  local v=""
+  if [ -f "$CONFIG" ]; then v="$(grep "^$1=" "$CONFIG" | tail -n 1 | cut -d= -f2- || true)"; fi
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+cfg_set() { # cfg_set KEY VALUE
+  mkdir -p "$CONFIG_DIR"
+  local tmp="$CONFIG.tmp.$$"
+  { if [ -f "$CONFIG" ]; then grep -v "^$1=" "$CONFIG" || true; fi; } > "$tmp"
+  printf '%s=%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" "$CONFIG"
+}
+
+# --- adb helpers ------------------------------------------------------------------
+need_tools() {
+  [ -x "$ADB" ] || die "adb not found at $ADB. Run the installer again (dex update)."
+  [ -x "$SCRCPY" ] || [ "${DEX_DRY_RUN:-0}" = "1" ] || die "scrcpy not found at $SCRCPY. Run the installer again (dex update)."
+}
+
+is_tcp() { case "$1" in *:*|*._adb-tls-connect._tcp*) return 0 ;; *) return 1 ;; esac; }
+
+# Fills USB_LIST / TCP_LIST (newline separated serials in state "device"), UNAUTH and NOPERM.
+scan_devices() {
+  USB_LIST=""; TCP_LIST=""; UNAUTH=""; NOPERM=""
+  local serial state rest
+  while read -r serial state rest; do
+    [ -n "$serial" ] || continue
+    case "$serial" in "List"|"*") continue ;; esac
+    case "$state" in
+      device)
+        if is_tcp "$serial"; then TCP_LIST="$TCP_LIST$serial"$'\n'; else USB_LIST="$USB_LIST$serial"$'\n'; fi ;;
+      unauthorized) UNAUTH="$UNAUTH$serial"$'\n' ;;
+      no) NOPERM="$NOPERM$serial"$'\n' ;; # "no permissions (missing udev rules?)"
+    esac
+  done < <("$ADB" devices -l 2>/dev/null || true)
+}
+first_line() { printf '%s' "$1" | head -n 1; }
+count_lines() { printf '%s' "$1" | grep -c . || true; }
+
+connected_ok() { grep -qi "connected to"; }
+
+mdns_connect() { # try auto-discovered wireless debugging endpoint; 0 on success
+  local ep
+  ep="$("$ADB" mdns services 2>/dev/null | awk '/_adb-tls-connect\._tcp/ {print $NF; exit}' || true)"
+  [ -n "$ep" ] || return 1
+  say "Found phone via mDNS: $ep"
+  if "$ADB" connect "$ep" 2>&1 | connected_ok; then
+    cfg_set DEX_LAST_ENDPOINT "$ep"
+    return 0
+  fi
+  return 1
+}
+saved_connect() {
+  local ep
+  ep="$(cfg_get DEX_LAST_ENDPOINT)"
+  [ -n "$ep" ] || return 1
+  say "Trying last endpoint $ep ..."
+  "$ADB" connect "$ep" 2>&1 | connected_ok
+}
+
+no_device_help() {
+  if [ -n "${NOPERM:-}" ]; then
+    err "The phone is plugged in but Linux blocks USB access (missing udev rule). Fix once, then replug:"
+    cat >&2 <<EOF
+  Debian/Ubuntu:  sudo apt install android-sdk-platform-tools-common
+  Other distros:  echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="04e8", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/51-android.rules
+                  sudo udevadm control --reload-rules
+  (Or skip USB: dex pair)
+EOF
+    return
+  fi
+  err "No phone found."
+  cat >&2 <<EOF
+Options:
+  1. Plug in the USB cable (and accept "Allow USB debugging" on the phone).
+  2. dex pair   - pair wirelessly (Wireless debugging), no cable needed.
+  3. dex wifi   - with the cable plugged in, switch the connection to Wi-Fi.
+EOF
+}
+unauth_help() {
+  err "Phone $(first_line "$UNAUTH") is unauthorized: accept the \"Allow USB debugging\" prompt on the phone, then retry."
+}
+
+# select_device MODE(auto|usb|wifi) -> sets SERIAL, TRANSPORT (usb|wifi)
+select_device() {
+  local mode="$1"
+  scan_devices
+  if [ "$mode" != "wifi" ] && [ -n "$USB_LIST" ]; then
+    SERIAL="$(first_line "$USB_LIST")"; TRANSPORT=usb
+    if [ "$(count_lines "$USB_LIST")" -gt 1 ]; then say "Several USB devices; using $SERIAL"; fi
+    return 0
+  fi
+  if [ "$mode" = "usb" ]; then
+    if [ -n "$UNAUTH" ]; then unauth_help; fi
+    no_device_help; exit 2
+  fi
+  if [ -z "$TCP_LIST" ]; then
+    if mdns_connect || saved_connect; then scan_devices; fi
+  fi
+  if [ -n "$TCP_LIST" ]; then
+    SERIAL="$(first_line "$TCP_LIST")"; TRANSPORT=wifi
+    if [ "$(count_lines "$TCP_LIST")" -gt 1 ]; then say "Several Wi-Fi devices; using $SERIAL"; fi
+    return 0
+  fi
+  if [ -n "$UNAUTH" ]; then unauth_help; fi
+  no_device_help; exit 2
+}
+
+# --- screen size --------------------------------------------------------------------
+detect_screen() { # prints "WxH" or nothing
+  local wh=""
+  if [ "$OS" = "Darwin" ]; then
+    local sp
+    sp="$(system_profiler SPDisplaysDataType 2>/dev/null || true)"
+    wh="$(printf '%s\n' "$sp" | sed -n 's/.*UI Looks like: *\([0-9]*\) x \([0-9]*\).*/\1x\2/p' | head -n 1)"
+    [ -n "$wh" ] || wh="$(printf '%s\n' "$sp" | sed -n 's/.*Resolution: *\([0-9]*\) x \([0-9]*\).*/\1x\2/p' | head -n 1)"
+  elif command -v xrandr >/dev/null 2>&1; then
+    local xr
+    xr="$(xrandr --current 2>/dev/null || true)"
+    wh="$(printf '%s\n' "$xr" | grep ' connected primary' | sed -n 's/.* \([0-9][0-9]*x[0-9][0-9]*\)+.*/\1/p' | head -n 1)"
+    [ -n "$wh" ] || wh="$(printf '%s\n' "$xr" | grep ' connected' | sed -n 's/.* \([0-9][0-9]*x[0-9][0-9]*\)+.*/\1/p' | head -n 1)"
+  fi
+  if [ -z "$wh" ] && [ "$OS" != "Darwin" ] && command -v xdpyinfo >/dev/null 2>&1; then
+    wh="$(xdpyinfo 2>/dev/null | sed -n 's/.*dimensions: *\([0-9]*x[0-9]*\) .*/\1/p' | head -n 1)"
+  fi
+  printf '%s' "$wh"
+}
+default_res() {
+  local wh w h
+  wh="$(detect_screen)"
+  case "$wh" in
+    [0-9]*x[0-9]*)
+      w=$(( ${wh%x*} * 80 / 100 / 8 * 8 )); h=$(( ${wh#*x} * 80 / 100 / 8 * 8 ))
+      if [ "$w" -ge 640 ] && [ "$h" -ge 480 ]; then printf '%sx%s' "$w" "$h"; return; fi ;;
+  esac
+  printf '1600x900'
+}
+
+profile_dpi() { case "$1" in school) echo 140 ;; *) echo 160 ;; esac; }
+
+# --- start -------------------------------------------------------------------------
+start() { # start PROFILE
+  local profile="$1"
+  need_tools
+  select_device "$MODE"
+  if [ -z "$(cfg_get DEX_KEYBOARD_HINT_SHOWN)" ]; then
+    say "Tip: for the Turkish Q layout run 'dex keyboard' once (physical keyboard settings on the phone)."
+    cfg_set DEX_KEYBOARD_HINT_SHOWN 1
+  fi
+
+  local dpi bitrate res codec="h264" mod
+  local extra_profile=()
+  case "$profile" in
+    code) bitrate=16 ;;
+    school) bitrate=12 ;;
+    movie)
+      bitrate=24; codec=h265; extra_profile=(--audio-buffer=80)
+      say "Netflix / Disney+ / Prime use DRM: video stays black inside a PC window (Android"
+      say "blocks capture of protected content). For DRM content use a USB-C to HDMI cable/hub to a"
+      say "monitor/TV (real DeX), Wireless DeX to a smart TV, or the streaming site in the PC's"
+      say "browser. YouTube, local files, Plex/Jellyfin work fine here." ;;
+    mirror) bitrate=12 ;;
+  esac
+  if [ "$TRANSPORT" = "wifi" ]; then bitrate=$(( bitrate / 2 )); fi
+
+  res="${OPT_RES:-$(cfg_get DEX_RES)}"
+  [ -n "$res" ] || res="$(default_res)"
+  dpi="${OPT_DPI:-$(cfg_get DEX_DPI)}"
+  [ -n "$dpi" ] || dpi="$(profile_dpi "$profile")"
+  mod="$(cfg_get DEX_SHORTCUT_MOD)"
+  if [ -z "$mod" ]; then
+    if [ "$OS" = "Darwin" ]; then mod=lsuper; else mod=lalt; fi
+  fi
+
+  local args=(-s "$SERIAL")
+  if [ "$profile" != "mirror" ]; then
+    args+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content
+      --keyboard=uhid --mouse=sdk --mouse-bind=++++:bhsn)
+  fi
+  args+=("--window-title=Galaxy DeX ($profile)" "--shortcut-mod=$mod")
+  if [ "$TRANSPORT" = "usb" ]; then args+=(--stay-awake); fi
+  if [ "$profile" = "mirror" ]; then
+    args+=(--keyboard=uhid --max-fps=60 "--video-bit-rate=${bitrate}M" --disable-screensaver)
+  else
+    args+=("--video-codec=$codec" --disable-screensaver --max-fps=60 "--video-bit-rate=${bitrate}M")
+    if [ "${#extra_profile[@]}" -gt 0 ]; then args+=("${extra_profile[@]}"); fi
+  fi
+  if [ "$OPT_SCREEN_OFF" = 1 ]; then args+=(--turn-screen-off); fi
+  if [ "$OPT_FULLSCREEN" = 1 ]; then args+=(--fullscreen); fi
+
+  local cfg_extra
+  cfg_extra="$(cfg_get DEX_EXTRA_ARGS)"
+  # shellcheck disable=SC2206
+  if [ -n "$cfg_extra" ]; then args+=($cfg_extra); fi
+  if [ "${#OPT_RAW[@]}" -gt 0 ]; then args+=("${OPT_RAW[@]}"); fi
+
+  export ADB
+  if [ "${DEX_DRY_RUN:-0}" = "1" ]; then
+    printf 'scrcpy'; printf ' %q' "${args[@]}"; printf '\n'
+    exit 0
+  fi
+  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res)..."
+  exec "$SCRCPY" "${args[@]}"
+}
+
+# --- other commands ----------------------------------------------------------------------
+pair_hints() {
+  cat >&2 <<EOF
+Could not pair/connect. Check:
+  - Phone and PC are on the same Wi-Fi network.
+  - School Wi-Fi may isolate clients: use a PC hotspot (phone joins it) or the USB cable.
+  - A phone hotspot does NOT work: Wireless debugging needs the phone to be a Wi-Fi client.
+EOF
+}
+
+cmd_pair() {
+  need_tools
+  cat <<EOF
+Pair without a cable:
+  Phone > Settings > Developer options > Wireless debugging ON
+  > "Pair device with pairing code".
+EOF
+  local pair="" code="" ep=""
+  read -r -p "Pairing IP:port (shown in the dialog): " pair || true
+  read -r -p "6-digit pairing code: " code || true
+  [ -n "$pair" ] && [ -n "$code" ] || die "Need both the pairing IP:port and the code."
+  if ! "$ADB" pair "$pair" "$code"; then
+    pair_hints; exit 1
+  fi
+  say "Paired. Now the connect port (Wireless debugging main screen: \"IP address & Port\")."
+  if ! mdns_connect; then
+    read -r -p "Connect IP:port: " ep || true
+    [ -n "$ep" ] || die "Need the connect IP:port."
+    if "$ADB" connect "$ep" 2>&1 | connected_ok; then
+      cfg_set DEX_LAST_ENDPOINT "$ep"
+    else
+      pair_hints; exit 1
+    fi
+  fi
+  ok "Connected. Run: dex"
+}
+
+cmd_connect() {
+  need_tools
+  local ep="${1:-}"
+  if [ -z "$ep" ]; then
+    if mdns_connect; then ok "Connected."; return 0; fi
+    ep="$(cfg_get DEX_LAST_ENDPOINT)"
+    if [ -z "$ep" ]; then
+      read -r -p "Phone IP:port (Wireless debugging screen): " ep || true
+    fi
+  fi
+  [ -n "$ep" ] || die "No endpoint given. Try: dex pair"
+  case "$ep" in *:*) ;; *) ep="$ep:5555" ;; esac
+  if "$ADB" connect "$ep" 2>&1 | connected_ok; then
+    cfg_set DEX_LAST_ENDPOINT "$ep"
+    ok "Connected to $ep. Run: dex"
+  else
+    pair_hints; exit 1
+  fi
+}
+
+cmd_wifi() {
+  need_tools
+  scan_devices
+  if [ -z "$USB_LIST" ]; then
+    if [ -n "$UNAUTH" ]; then unauth_help; fi
+    err "Plug the phone in with USB first."; exit 2
+  fi
+  local s ip
+  s="$(first_line "$USB_LIST")"
+  "$ADB" -s "$s" tcpip 5555 >/dev/null
+  sleep 2
+  ip="$("$ADB" -s "$s" shell ip -f inet addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n 1)"
+  [ -n "$ip" ] || die "Could not read the phone's Wi-Fi IP. Is Wi-Fi on?"
+  if "$ADB" connect "$ip:5555" 2>&1 | connected_ok; then
+    cfg_set DEX_LAST_ENDPOINT "$ip:5555"
+    ok "Connected over Wi-Fi ($ip:5555). You can unplug the cable (works until the phone reboots)."
+  else
+    pair_hints; exit 1
+  fi
+}
+
+cmd_keyboard() {
+  need_tools
+  select_device "$MODE"
+  "$ADB" -s "$SERIAL" shell am start -a android.settings.HARD_KEYBOARD_SETTINGS >/dev/null
+  ok "Opened the keyboard settings on the phone. Pick Turkish Q as the layout."
+}
+
+cmd_doctor() {
+  need_tools
+  say "scrcpy: $("$SCRCPY" --version 2>/dev/null | head -n 1 || echo 'not runnable')"
+  say "adb:    $("$ADB" version 2>/dev/null | head -n 1 || echo 'not runnable')"
+  say "devices:"
+  "$ADB" devices -l 2>/dev/null | sed 's/^/  /' || true
+  scan_devices
+  if [ -z "$USB_LIST$TCP_LIST" ]; then
+    if [ -n "$UNAUTH" ]; then unauth_help; fi
+    no_device_help; exit 2
+  fi
+  local s model sdk one ui
+  s="$(first_line "$USB_LIST$TCP_LIST")"
+  model="$("$ADB" -s "$s" shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
+  sdk="$("$ADB" -s "$s" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')"
+  one="$("$ADB" -s "$s" shell getprop ro.build.version.oneui 2>/dev/null | tr -d '\r')"
+  say "phone:   ${model:-unknown} (Android SDK ${sdk:-?})"
+  case "$one" in
+    [0-9]*)
+      ui="$(( one / 10000 )).$(( one % 10000 / 100 ))"
+      say "One UI:  $ui"
+      if [ "$one" -lt 80000 ]; then
+        warn "One UI $ui is too old: DeX on a virtual display needs One UI 8+."
+      else
+        ok "One UI 8+ detected."
+      fi ;;
+    *) warn "Could not read One UI version (not a Samsung phone, or One UI < 8?)." ;;
+  esac
+}
+
+cmd_update() {
+  if [ -n "${DEX_SOURCE_DIR:-}" ] && [ -f "$DEX_SOURCE_DIR/install.sh" ]; then
+    exec bash "$DEX_SOURCE_DIR/install.sh"
+  fi
+  command -v curl >/dev/null 2>&1 || die "Need curl to update."
+  curl -fsSL "https://raw.githubusercontent.com/$DEX_REPO/main/install.sh" | bash
+}
+
+cmd_uninstall() {
+  if [ -x "$ROOT/scrcpy/adb" ]; then "$ROOT/scrcpy/adb" kill-server >/dev/null 2>&1 || true; fi
+  # Remove only what dex created; DEX_HOME may point at a shared folder.
+  rm -rf "$ROOT/scrcpy" "$CONFIG_DIR"
+  rmdir "$ROOT" 2>/dev/null || true
+  rm -f "$HOME/.local/share/applications/galaxy-dex.desktop" "$HOME/Applications/Galaxy DeX.command"
+  local rc tmp
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    tmp="$rc.dex.$$"
+    grep -v '# dex$' "$rc" > "$tmp" || true
+    cat "$tmp" > "$rc"
+    rm -f "$tmp"
+  done
+  rm -f "$HOME/.local/bin/dex"
+  ok "dex removed."
+  exit 0
+}
+
+# --- main -------------------------------------------------------------------------------
+MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN_OFF=0; OPT_FULLSCREEN=0; OPT_RAW=()
+CMD="code"
+if [ $# -gt 0 ]; then
+  case "$1" in -*) ;; *) CMD="$1"; shift ;; esac
+fi
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --res) [ $# -ge 2 ] || die "--res needs WxH"; OPT_RES="$2"; shift 2 ;;
+    --res=*) OPT_RES="${1#*=}"; shift ;;
+    --dpi) [ $# -ge 2 ] || die "--dpi needs a number"; OPT_DPI="$2"; shift 2 ;;
+    --dpi=*) OPT_DPI="${1#*=}"; shift ;;
+    --usb) MODE=usb; shift ;;
+    --wifi) MODE=wifi; shift ;;
+    --screen-off) OPT_SCREEN_OFF=1; shift ;;
+    --fullscreen) OPT_FULLSCREEN=1; shift ;;
+    -h|--help) CMD=help; shift ;;
+    --) shift; OPT_RAW=("$@"); break ;;
+    -*) die "Unknown option: $1 (see: dex help)" ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+case "$OPT_RES" in ""|[0-9]*x[0-9]*) ;; *) die "--res must look like 1600x900" ;; esac
+case "$OPT_DPI" in ""|[0-9]*) ;; *) die "--dpi must be a number" ;; esac
+
+case "$CMD" in
+  code|school|movie|mirror) start "$CMD" ;;
+  pair) cmd_pair ;;
+  connect) cmd_connect "${POS[0]:-}" ;;
+  wifi) cmd_wifi ;;
+  keyboard) cmd_keyboard ;;
+  doctor) cmd_doctor ;;
+  update) cmd_update ;;
+  uninstall) cmd_uninstall ;;
+  help) usage ;;
+  *) err "Unknown command: $CMD"; usage >&2; exit 1 ;;
+esac

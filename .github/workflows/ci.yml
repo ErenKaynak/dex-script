@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck install.sh bin/dex
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path install.ps1, bin/dex.ps1 -ExcludeRule PSAvoidUsingWriteHost
+          $r | Format-Table -AutoSize
+          if ($r | Where-Object Severity -in 'Error', 'Warning') { exit 1 }
+
+  install-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      DEX_SOURCE_DIR: ${{ github.workspace }}
+      DEX_NO_SHORTCUT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: install (piped, like the one-liner)
+        run: bash < install.sh
+      - name: install again (idempotent)
+        run: bash install.sh
+      - name: smoke test
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          "$HOME/.local/share/dex/scrcpy/scrcpy" --version
+          dex help
+          dex doctor || true
+          set +e; dex; code=$?; set -e
+          echo "dex without device exited $code"; test "$code" -eq 2
+      - name: uninstall
+        run: |
+          "$HOME/.local/bin/dex" uninstall
+          test ! -e "$HOME/.local/bin/dex"
+          test ! -e "$HOME/.local/share/dex"
+
+  install-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    env:
+      DEX_SOURCE_DIR: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install (piped, like the one-liner)
+        shell: ${{ matrix.shell }}
+        run: Get-Content -Raw install.ps1 | Invoke-Expression
+      - name: smoke test
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:LOCALAPPDATA\dex\scrcpy\scrcpy.exe" --version
+          & "$env:LOCALAPPDATA\dex\bin\dex.cmd" help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:LOCALAPPDATA\dex\bin\dex.cmd"
+          Write-Host "dex without device exited $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 2) { exit 1 }
+          exit 0
+      - name: uninstall
+        shell: ${{ matrix.shell }}
+        run: |
+          & "$env:LOCALAPPDATA\dex\bin\dex.cmd" uninstall
+          if (Test-Path "$env:LOCALAPPDATA\dex") { Write-Error "not removed"; exit 1 }
