@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # dex - Samsung DeX in a resizable window on your PC (scrcpy virtual display).
 # Linux / macOS, bash 3.2 compatible, no sudo.
-set -euo pipefail
+set -uo pipefail
 
 DEX_REPO="${DEX_REPO:-ErenKaynak/dex-script}"
 ROOT="${DEX_HOME:-$HOME/.local/share/dex}"
-SCRCPY="$ROOT/scrcpy/scrcpy"
+SCRCPY="${DEX_SCRCPY:-$ROOT/scrcpy/scrcpy}"
 ADB="${DEX_ADB:-$ROOT/scrcpy/adb}"
 CONFIG_DIR="${DEX_CONFIG_DIR:-$HOME/.config/dex}"
 CONFIG="$CONFIG_DIR/config"
 OS="$(uname -s)"
 
 if [ -t 1 ]; then
-  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_B=$'\033[1m'; C_OFF=$'\033[0m'
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+  C_CYAN=$'\033[36m'; C_OFF=$'\033[0m'
 else
-  C_OK=""; C_WARN=""; C_ERR=""; C_B=""; C_OFF=""
+  C_OK=""; C_WARN=""; C_ERR=""; C_B=""; C_DIM=""; C_CYAN=""; C_OFF=""
 fi
 say() { printf '%s\n' "$*"; }
 ok() { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*"; }
@@ -26,16 +27,18 @@ usage() {
   cat <<EOF
 ${C_B}dex${C_OFF} - Samsung DeX in a window on your PC
 
-Usage: dex [command] [options] [-- extra scrcpy args]
+Usage: dex                       interactive menu (pick 1, 2, 3 ...)
+       dex [command] [options] [-- extra scrcpy args]
 
 Commands:
-  dex, dex code      start DeX, profile "code" (default)
-  dex school         start DeX, profile "school" (denser, for Word/Excel)
+  dex code           start DeX, profile "code" (crisp text, coding, browser)
+  dex school         start DeX, profile "school" (denser, Word/Excel side by side)
   dex movie          start DeX, profile "movie" (high bitrate, H.265)
   dex mirror         plain phone-screen mirror (no virtual display)
   dex pair           wireless pairing without a cable
   dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
   dex wifi           switch a USB-connected phone to Wi-Fi
+  dex wake           wake the phone / unfreeze a stuck DeX window
   dex keyboard       open phone keyboard settings (pick Turkish Q)
   dex doctor         show versions, devices and phone info
   dex update         re-run the installer (latest scripts)
@@ -43,16 +46,22 @@ Commands:
   dex help           this text
 
 Options (start commands):
-  --res WxH      initial window size (default: 80% of your screen)
-  --dpi N        DeX density (code 160, school 140, movie 160)
-  --usb          force USB device
-  --wifi         force Wi-Fi device
-  --screen-off   turn the phone panel off while running
-  --fullscreen   start fullscreen
-  --             pass everything after it to scrcpy
+  --res WxH          initial window size (default: 80% of your screen)
+  --dpi N            DeX density (code 160, school 140, movie 160)
+  --usb / --wifi     force the transport
+  --screen on|dim|off  phone panel while DeX runs (default: on; see below)
+  --screen-off       same as --screen off
+  --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
+  --no-freeform      skip the One UI 8.5+/9 windowing fix
+  --                 pass everything after it to scrcpy
+
+Phone screen: "on" is the safe default (DeX never freezes). "dim" keeps the panel
+technically on but at minimum brightness and restores it afterwards. "off" turns the
+panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: $CONFIG
-  (DEX_SHORTCUT_MOD, DEX_DPI, DEX_RES, DEX_EXTRA_ARGS, DEX_LAST_ENDPOINT)
+  DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
+  DEX_FREEFORM, DEX_LAST_ENDPOINT
 EOF
 }
 
@@ -141,9 +150,10 @@ unauth_help() {
   err "Phone $(first_line "$UNAUTH") is unauthorized: accept the \"Allow USB debugging\" prompt on the phone, then retry."
 }
 
-# select_device MODE(auto|usb|wifi) -> sets SERIAL, TRANSPORT (usb|wifi)
+# select_device MODE(auto|usb|wifi) -> sets SERIAL, TRANSPORT (usb|wifi); returns 2 if none
 select_device() {
   local mode="$1"
+  SERIAL=""; TRANSPORT=""
   scan_devices
   if [ "$mode" != "wifi" ] && [ -n "$USB_LIST" ]; then
     SERIAL="$(first_line "$USB_LIST")"; TRANSPORT=usb
@@ -152,7 +162,7 @@ select_device() {
   fi
   if [ "$mode" = "usb" ]; then
     if [ -n "$UNAUTH" ]; then unauth_help; fi
-    no_device_help; exit 2
+    no_device_help; return 2
   fi
   if [ -z "$TCP_LIST" ]; then
     if mdns_connect || saved_connect; then scan_devices; fi
@@ -163,8 +173,74 @@ select_device() {
     return 0
   fi
   if [ -n "$UNAUTH" ]; then unauth_help; fi
-  no_device_help; exit 2
+  no_device_help; return 2
 }
+
+# phone_shell CMD... : adb shell on $SERIAL, CRs stripped, never fails the script
+phone_shell() { "$ADB" -s "$SERIAL" shell "$@" 2>/dev/null | tr -d '\r' || true; }
+
+# --- phone state --------------------------------------------------------------------
+# One UI 8.5 / 9 (Android 16 QPR2+) no longer enables desktop windowing on app-created
+# virtual displays: DeX starts, but every app opens fullscreen and cannot be moved or
+# resized. The per-display windowing mode can be forced with a shell command
+# (5 = WINDOWING_MODE_FREEFORM). On One UI 8.0 the command does not exist and is not needed.
+enable_freeform() { # enable_freeform DISPLAY_ID
+  [ "${FREEFORM:-1}" = 1 ] || return 0
+  if "$ADB" -s "$SERIAL" shell wm set-display-windowing-mode -d "$1" 5 >/dev/null 2>&1; then
+    ok "Desktop windowing enabled on DeX display $1 (apps open as movable windows)."
+  else
+    say "${C_DIM}Display $1: windowing-mode command not available (One UI 8.0?), freeform should already be on.${C_OFF}"
+  fi
+}
+
+# Wake a sleeping/dozing phone: scrcpy 5.0.1 does not do it for a new virtual display, and a
+# dozing Galaxy never renders the DeX display (you see nothing or a frozen frame).
+wake_phone() {
+  local wk
+  wk="$(phone_shell dumpsys power | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)"
+  case "$wk" in
+    Asleep|Dozing) say "Waking the phone..."; phone_shell input keyevent KEYCODE_WAKEUP >/dev/null; sleep 1 ;;
+  esac
+  if phone_shell dumpsys window policy | awk '/KeyguardServiceDelegate/{f=1} f && /showing=true/{found=1; exit} END{exit !found}'; then
+    warn "The phone is locked. Unlock it, or DeX shows only the lock screen (Samsung also hides the dock while locked)."
+  fi
+}
+
+# Phone panel while DeX runs. "dim": minimum brightness, restored on exit (safe on every
+# Galaxy). "off": scrcpy turns the panel off; some Galaxy phones then doze and the DeX
+# window freezes (dex wake recovers).
+SAVED_BRI=""; SAVED_BRI_MODE=""
+dim_on() {
+  SAVED_BRI="$(phone_shell settings get system screen_brightness)"
+  SAVED_BRI_MODE="$(phone_shell settings get system screen_brightness_mode)"
+  phone_shell settings put system screen_brightness_mode 0 >/dev/null
+  phone_shell settings put system screen_brightness 0 >/dev/null
+  say "${C_DIM}Phone screen dimmed (restored when DeX closes).${C_OFF}"
+}
+dim_off() {
+  case "$SAVED_BRI" in [0-9]*) phone_shell settings put system screen_brightness "$SAVED_BRI" >/dev/null ;; esac
+  case "$SAVED_BRI_MODE" in [0-9]*) phone_shell settings put system screen_brightness_mode "$SAVED_BRI_MODE" >/dev/null ;; esac
+  SAVED_BRI=""; SAVED_BRI_MODE=""
+}
+
+SAVED_FREEFORM_SUPPORT=""
+freeform_support_on() { # standard "Enable freeform windows" developer option, needed on some builds
+  SAVED_FREEFORM_SUPPORT="$(phone_shell settings get global enable_freeform_support)"
+  case "$SAVED_FREEFORM_SUPPORT" in
+    1) SAVED_FREEFORM_SUPPORT="" ;; # already on, nothing to restore
+    *) phone_shell settings put global enable_freeform_support 1 >/dev/null ;;
+  esac
+}
+freeform_support_off() {
+  case "$SAVED_FREEFORM_SUPPORT" in
+    "") ;;
+    null) phone_shell settings delete global enable_freeform_support >/dev/null ;;
+    *) phone_shell settings put global enable_freeform_support "$SAVED_FREEFORM_SUPPORT" >/dev/null ;;
+  esac
+  SAVED_FREEFORM_SUPPORT=""
+}
+
+restore_phone() { dim_off; freeform_support_off; }
 
 # --- screen size --------------------------------------------------------------------
 detect_screen() { # prints "WxH" or nothing
@@ -185,30 +261,53 @@ detect_screen() { # prints "WxH" or nothing
   fi
   printf '%s' "$wh"
 }
-default_res() {
-  local wh w h
+default_res() { # default_res PERCENT
+  local wh w h pct="$1"
   wh="$(detect_screen)"
   case "$wh" in
     [0-9]*x[0-9]*)
-      w=$(( ${wh%x*} * 80 / 100 / 8 * 8 )); h=$(( ${wh#*x} * 80 / 100 / 8 * 8 ))
+      w=$(( ${wh%x*} * pct / 100 / 8 * 8 )); h=$(( ${wh#*x} * pct / 100 / 8 * 8 ))
       if [ "$w" -ge 640 ] && [ "$h" -ge 480 ]; then printf '%sx%s' "$w" "$h"; return; fi ;;
   esac
-  printf '1600x900'
+  if [ "$pct" -ge 100 ]; then printf '1920x1080'; else printf '1600x900'; fi
 }
 
 profile_dpi() { case "$1" in school) echo 140 ;; *) echo 160 ;; esac; }
+profile_desc() {
+  case "$1" in
+    code) echo "crisp text: coding, T3, browser" ;;
+    school) echo "more room: Word / Excel side by side" ;;
+    movie) echo "high bitrate, H.265, smooth audio" ;;
+    mirror) echo "plain phone screen, no DeX" ;;
+  esac
+}
+
+# Runs scrcpy, applies the freeform fix as soon as the virtual display exists, returns scrcpy's
+# exit code. The reader ignores Ctrl+C so it keeps draining until scrcpy has exited.
+run_scrcpy() {
+  "$SCRCPY" "$@" 2>&1 | (
+    trap '' INT
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+      case "$line" in
+        *"New display:"*"(id="*) id="${line##*(id=}"; enable_freeform "${id%%)*}" ;;
+      esac
+    done
+  )
+  return "${PIPESTATUS[0]}"
+}
 
 # --- start -------------------------------------------------------------------------
-start() { # start PROFILE
+start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   local profile="$1"
   need_tools
-  select_device "$MODE"
+  select_device "$MODE" || return 2
   if [ -z "$(cfg_get DEX_KEYBOARD_HINT_SHOWN)" ]; then
     say "Tip: for the Turkish Q layout run 'dex keyboard' once (physical keyboard settings on the phone)."
     cfg_set DEX_KEYBOARD_HINT_SHOWN 1
   fi
 
-  local dpi bitrate res codec="h264" mod
+  local dpi bitrate res codec="h264" mod screen fullscreen
   local extra_profile=()
   case "$profile" in
     code) bitrate=16 ;;
@@ -223,14 +322,22 @@ start() { # start PROFILE
   esac
   if [ "$TRANSPORT" = "wifi" ]; then bitrate=$(( bitrate / 2 )); fi
 
+  fullscreen="${OPT_FULLSCREEN:-$(cfg_get DEX_FULLSCREEN)}"
   res="${OPT_RES:-$(cfg_get DEX_RES)}"
-  [ -n "$res" ] || res="$(default_res)"
+  if [ -z "$res" ]; then
+    if [ "$fullscreen" = 1 ]; then res="$(default_res 100)"; else res="$(default_res 80)"; fi
+  fi
   dpi="${OPT_DPI:-$(cfg_get DEX_DPI)}"
   [ -n "$dpi" ] || dpi="$(profile_dpi "$profile")"
   mod="$(cfg_get DEX_SHORTCUT_MOD)"
   if [ -z "$mod" ]; then
     if [ "$OS" = "Darwin" ]; then mod=lsuper; else mod=lalt; fi
   fi
+  screen="${OPT_SCREEN:-$(cfg_get DEX_SCREEN)}"
+  case "$screen" in on|dim|off) ;; *) screen=on ;; esac
+  FREEFORM="${OPT_FREEFORM:-$(cfg_get DEX_FREEFORM)}"
+  [ "$FREEFORM" = 0 ] || FREEFORM=1
+  [ "$profile" != "mirror" ] || FREEFORM=0 # no virtual display to fix
 
   local args=(-s "$SERIAL")
   if [ "$profile" != "mirror" ]; then
@@ -238,29 +345,50 @@ start() { # start PROFILE
       --keyboard=uhid --mouse=sdk --mouse-bind=++++:bhsn)
   fi
   args+=("--window-title=Galaxy DeX ($profile)" "--shortcut-mod=$mod")
+  # --keep-active: simulated user activity keeps the phone from sleeping on USB *and* Wi-Fi
+  # (a sleeping phone stops rendering the DeX display). --stay-awake only works when plugged in.
+  args+=(--keep-active --disable-screensaver --max-fps=60 "--video-bit-rate=${bitrate}M")
   if [ "$TRANSPORT" = "usb" ]; then args+=(--stay-awake); fi
+  if [ "$TRANSPORT" = "wifi" ]; then args+=(--video-buffer=50); fi # absorbs Wi-Fi jitter (stutter/freezes)
   if [ "$profile" = "mirror" ]; then
-    args+=(--keyboard=uhid --max-fps=60 "--video-bit-rate=${bitrate}M" --disable-screensaver)
+    args+=(--keyboard=uhid)
   else
-    args+=("--video-codec=$codec" --disable-screensaver --max-fps=60 "--video-bit-rate=${bitrate}M")
+    args+=("--video-codec=$codec")
     if [ "${#extra_profile[@]}" -gt 0 ]; then args+=("${extra_profile[@]}"); fi
   fi
-  if [ "$OPT_SCREEN_OFF" = 1 ]; then args+=(--turn-screen-off); fi
-  if [ "$OPT_FULLSCREEN" = 1 ]; then args+=(--fullscreen); fi
+  if [ "$screen" = off ]; then args+=(--turn-screen-off); fi
+  if [ "$fullscreen" = 1 ]; then args+=(--fullscreen); fi
 
-  local cfg_extra
+  local cfg_extra tok
   cfg_extra="$(cfg_get DEX_EXTRA_ARGS)"
-  # shellcheck disable=SC2206
-  if [ -n "$cfg_extra" ]; then args+=($cfg_extra); fi
+  if [ -n "$cfg_extra" ]; then
+    # Quote-aware split ("--window-title='My DeX'" stays one argument), no globbing, no eval.
+    while IFS= read -r tok; do [ -n "$tok" ] && args+=("$tok"); done < <(printf '%s\n' "$cfg_extra" | xargs printf '%s\n' 2>/dev/null)
+  fi
   if [ "${#OPT_RAW[@]}" -gt 0 ]; then args+=("${OPT_RAW[@]}"); fi
 
   export ADB
   if [ "${DEX_DRY_RUN:-0}" = "1" ]; then
     printf 'scrcpy'; printf ' %q' "${args[@]}"; printf '\n'
-    exit 0
+    return 0
   fi
-  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res)..."
-  exec "$SCRCPY" "${args[@]}"
+
+  wake_phone
+  if [ "$FREEFORM" = 1 ]; then freeform_support_on; fi
+  if [ "$screen" = dim ]; then dim_on; fi
+  trap 'restore_phone' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
+  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen)..."
+  say "${C_DIM}Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake${C_OFF}"
+  local rc
+  run_scrcpy "${args[@]}"; rc=$?
+  trap - INT TERM
+  restore_phone
+  case "$rc" in
+    0) ok "DeX closed. Your apps moved back to the phone." ;;
+    2) warn "The phone disconnected (cable unplugged, Wi-Fi dropped or the phone slept)." ;;
+    *) err "scrcpy exited with code $rc." ;;
+  esac
+  return "$rc"
 }
 
 # --- other commands ----------------------------------------------------------------------
@@ -283,18 +411,18 @@ EOF
   local pair="" code="" ep=""
   read -r -p "Pairing IP:port (shown in the dialog): " pair || true
   read -r -p "6-digit pairing code: " code || true
-  [ -n "$pair" ] && [ -n "$code" ] || die "Need both the pairing IP:port and the code."
+  if [ -z "$pair" ] || [ -z "$code" ]; then err "Need both the pairing IP:port and the code."; return 1; fi
   if ! "$ADB" pair "$pair" "$code"; then
-    pair_hints; exit 1
+    pair_hints; return 1
   fi
   say "Paired. Now the connect port (Wireless debugging main screen: \"IP address & Port\")."
   if ! mdns_connect; then
     read -r -p "Connect IP:port: " ep || true
-    [ -n "$ep" ] || die "Need the connect IP:port."
+    if [ -z "$ep" ]; then err "Need the connect IP:port."; return 1; fi
     if "$ADB" connect "$ep" 2>&1 | connected_ok; then
       cfg_set DEX_LAST_ENDPOINT "$ep"
     else
-      pair_hints; exit 1
+      pair_hints; return 1
     fi
   fi
   ok "Connected. Run: dex"
@@ -310,13 +438,13 @@ cmd_connect() {
       read -r -p "Phone IP:port (Wireless debugging screen): " ep || true
     fi
   fi
-  [ -n "$ep" ] || die "No endpoint given. Try: dex pair"
+  if [ -z "$ep" ]; then err "No endpoint given. Try: dex pair"; return 1; fi
   case "$ep" in *:*) ;; *) ep="$ep:5555" ;; esac
   if "$ADB" connect "$ep" 2>&1 | connected_ok; then
     cfg_set DEX_LAST_ENDPOINT "$ep"
     ok "Connected to $ep. Run: dex"
   else
-    pair_hints; exit 1
+    pair_hints; return 1
   fi
 }
 
@@ -325,27 +453,44 @@ cmd_wifi() {
   scan_devices
   if [ -z "$USB_LIST" ]; then
     if [ -n "$UNAUTH" ]; then unauth_help; fi
-    err "Plug the phone in with USB first."; exit 2
+    err "Plug the phone in with USB first."; return 2
   fi
   local s ip
   s="$(first_line "$USB_LIST")"
   "$ADB" -s "$s" tcpip 5555 >/dev/null
   sleep 2
   ip="$("$ADB" -s "$s" shell ip -f inet addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n 1)"
-  [ -n "$ip" ] || die "Could not read the phone's Wi-Fi IP. Is Wi-Fi on?"
+  if [ -z "$ip" ]; then err "Could not read the phone's Wi-Fi IP. Is Wi-Fi on?"; return 1; fi
   if "$ADB" connect "$ip:5555" 2>&1 | connected_ok; then
     cfg_set DEX_LAST_ENDPOINT "$ip:5555"
     ok "Connected over Wi-Fi ($ip:5555). You can unplug the cable (works until the phone reboots)."
   else
-    pair_hints; exit 1
+    pair_hints; return 1
   fi
+}
+
+cmd_wake() {
+  need_tools
+  select_device "$MODE" || return 2
+  # -d 0 targets the phone panel (Android 14+ needs the display id), the second call is the fallback.
+  phone_shell input -d 0 keyevent KEYCODE_WAKEUP >/dev/null
+  phone_shell input keyevent KEYCODE_WAKEUP >/dev/null
+  ok "Wake-up sent. If the DeX window is still frozen: unlock the phone, or press Alt+Shift+r in the window."
 }
 
 cmd_keyboard() {
   need_tools
-  select_device "$MODE"
-  "$ADB" -s "$SERIAL" shell am start -a android.settings.HARD_KEYBOARD_SETTINGS >/dev/null
+  select_device "$MODE" || return 2
+  if ! "$ADB" -s "$SERIAL" shell am start -a android.settings.HARD_KEYBOARD_SETTINGS >/dev/null; then
+    err "Could not open the keyboard settings on the phone."; return 1
+  fi
   ok "Opened the keyboard settings on the phone. Pick Turkish Q as the layout."
+}
+
+one_ui_version() { # one_ui_version SERIAL -> "9.0" or ""
+  local one
+  one="$("$ADB" -s "$1" shell getprop ro.build.version.oneui 2>/dev/null | tr -d '\r')"
+  case "$one" in [0-9]*) printf '%s.%s' "$(( one / 10000 ))" "$(( one % 10000 / 100 ))" ;; esac
 }
 
 cmd_doctor() {
@@ -357,25 +502,33 @@ cmd_doctor() {
   scan_devices
   if [ -z "$USB_LIST$TCP_LIST" ]; then
     if [ -n "$UNAUTH" ]; then unauth_help; fi
-    no_device_help; exit 2
+    no_device_help; return 2
   fi
-  local s model sdk one ui
+  local s model sdk ui wk
   s="$(first_line "$USB_LIST$TCP_LIST")"
-  model="$("$ADB" -s "$s" shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
-  sdk="$("$ADB" -s "$s" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r')"
-  one="$("$ADB" -s "$s" shell getprop ro.build.version.oneui 2>/dev/null | tr -d '\r')"
+  SERIAL="$s"
+  model="$(phone_shell getprop ro.product.model)"
+  sdk="$(phone_shell getprop ro.build.version.sdk)"
+  ui="$(one_ui_version "$s")"
   say "phone:   ${model:-unknown} (Android SDK ${sdk:-?})"
-  case "$one" in
-    [0-9]*)
-      ui="$(( one / 10000 )).$(( one % 10000 / 100 ))"
-      say "One UI:  $ui"
-      if [ "$one" -lt 80000 ]; then
-        warn "One UI $ui is too old: DeX on a virtual display needs One UI 8+."
-      else
-        ok "One UI 8+ detected."
-      fi ;;
-    *) warn "Could not read One UI version (not a Samsung phone, or One UI < 8?)." ;;
-  esac
+  if [ -n "$ui" ]; then
+    say "One UI:  $ui"
+    if [ "${ui%%.*}" -lt 8 ]; then
+      warn "One UI $ui is too old: DeX on a virtual display needs One UI 8+."
+    else
+      ok "One UI 8+ detected."
+      case "$ui" in
+        8.0) say "One UI 8.0: desktop windowing works out of the box." ;;
+        *) say "One UI 8.5+/9: dex forces desktop windowing on the DeX display at start (the fix for fullscreen-only apps)." ;;
+      esac
+    fi
+  else
+    warn "Could not read One UI version (not a Samsung phone, or One UI < 8?)."
+  fi
+  wk="$(phone_shell dumpsys power | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)"
+  [ -n "$wk" ] && say "power:   $wk"
+  say "freeform support: $(phone_shell settings get global enable_freeform_support)"
+  return 0
 }
 
 cmd_update() {
@@ -405,9 +558,145 @@ cmd_uninstall() {
   exit 0
 }
 
+# --- interactive menu (TUI) -------------------------------------------------------------
+# Box drawing needs a UTF-8 terminal; fall back to ASCII otherwise.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+  *UTF-8*|*utf-8*|*UTF8*|*utf8*) TL="╭"; TR="╮"; BL="╰"; BR="╯"; H="─"; V="│"; ML="├"; MR="┤"; ARROW="›" ;;
+  *) TL="+"; TR="+"; BL="+"; BR="+"; H="-"; V="|"; ML="+"; MR="+"; ARROW=">" ;;
+esac
+BOX_W=58 # inner width
+
+hline() { # hline LEFT RIGHT
+  local i=0 s=""
+  while [ $i -lt $BOX_W ]; do s="$s$H"; i=$((i+1)); done
+  printf '  %s%s%s%s%s\n' "$C_CYAN" "$1" "$s" "$2" "$C_OFF"
+}
+row() { # row TEXT (plain ASCII, padded)
+  printf '  %s%s%s %-*s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" $((BOX_W-2)) "$1" "$C_CYAN" "$V" "$C_OFF"
+}
+row_item() { # row_item KEY LABEL DESC
+  printf '  %s%s%s  %s%-2s%s %-9s %-*s%s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_B" "$1" "$C_OFF" "$2" $((BOX_W-15)) "$3" "$C_CYAN" "$V" "$C_OFF"
+}
+row_kv() { # row_kv LABEL VALUE [LABEL2 VALUE2]
+  local left right=""
+  left="$(printf '%-9s %s' "$1" "$2")"
+  if [ -n "${3:-}" ]; then right="$(printf '%s %s' "$3" "${4:-}")"; fi
+  printf '  %s%s%s %s%-*s%s%s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_DIM" $((BOX_W-2-${#right})) "$left" "$right" "$C_OFF" "$C_CYAN" "$V" "$C_OFF"
+}
+
+TUI_MODEL=""; TUI_SERIAL_SEEN=""
+tui_phone_status() { # sets TUI_PHONE (status text)
+  TUI_PHONE="no phone found  (plug in USB, or p = pair)"
+  scan_devices
+  local s="" transport="" ui=""
+  if [ -n "$USB_LIST" ]; then s="$(first_line "$USB_LIST")"; transport="USB"
+  elif [ -n "$TCP_LIST" ]; then s="$(first_line "$TCP_LIST")"; transport="Wi-Fi"
+  elif [ -n "$UNAUTH" ]; then TUI_PHONE="phone found, UNAUTHORIZED: accept the prompt on the phone"; return
+  elif [ -n "$NOPERM" ]; then TUI_PHONE="USB blocked by udev rule (see: dex doctor)"; return
+  fi
+  [ -n "$s" ] || return
+  if [ "$s" != "$TUI_SERIAL_SEEN" ]; then
+    SERIAL="$s"
+    TUI_MODEL="$(phone_shell getprop ro.product.model)"
+    ui="$(one_ui_version "$s")"
+    [ -n "$ui" ] && TUI_MODEL="$TUI_MODEL, One UI $ui"
+    TUI_SERIAL_SEEN="$s"
+  fi
+  TUI_PHONE="${TUI_MODEL:-$s} via $transport"
+}
+
+tui_draw() {
+  local ver screen fullscreen res dpi
+  ver="$("$SCRCPY" --version 2>/dev/null | head -n 1 | awk '{print $2}')"
+  screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
+  if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then fullscreen="fullscreen"; else fullscreen="window"; fi
+  res="$(cfg_get DEX_RES)"; [ -n "$res" ] || res="auto"
+  dpi="$(cfg_get DEX_DPI)"; [ -n "$dpi" ] || dpi="auto"
+  tui_phone_status
+  printf '\033[H\033[2J' # clear
+  say ""
+  hline "$TL" "$TR"
+  printf '  %s%s%s %s%-*s%s%s%s%s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_B" $((BOX_W-2-${#ver}-7)) "Galaxy DeX" "$C_OFF" "$C_DIM" "scrcpy $ver" "$C_OFF" "$C_CYAN" "$V" "$C_OFF"
+  hline "$ML" "$MR"
+  row_kv "Phone" "$TUI_PHONE"
+  row_kv "Screen" "phone $screen" "$fullscreen," "$res @ $dpi"
+  hline "$ML" "$MR"
+  row_item 1 "Code" "$(profile_desc code)"
+  row_item 2 "School" "$(profile_desc school)"
+  row_item 3 "Movie" "$(profile_desc movie)"
+  row_item 4 "Mirror" "$(profile_desc mirror)"
+  row ""
+  row_item p "Pair" "Wi-Fi pairing with a code (no cable)"
+  row_item c "Connect" "reconnect over Wi-Fi"
+  row_item w "Wi-Fi" "USB plugged in -> switch to Wi-Fi"
+  row_item k "Keyboard" "phone keyboard layout (Turkish Q)"
+  row_item s "Screen" "phone panel while DeX runs: on / dim / off"
+  row_item f "Window" "toggle window / fullscreen start"
+  row_item r "Size" "set window size and DPI"
+  row_item d "Doctor" "versions, devices, One UI check"
+  row_item x "Wake" "unfreeze a stuck DeX window"
+  row_item u "Update" "re-run the installer"
+  row_item q "Quit" ""
+  hline "$BL" "$BR"
+  if [ -n "${TUI_MSG:-}" ]; then say "  $TUI_MSG"; TUI_MSG=""; fi
+  printf '  Choose (Enter = 1) %s ' "$ARROW"
+}
+
+tui_pause() { say ""; printf '  %sPress any key to return to the menu...%s' "$C_DIM" "$C_OFF"; read -rsn1 _ || true; }
+
+tui_run() { # tui_run FUNC ARGS... : run a command, then pause so the output can be read
+  local rc
+  printf '\033[H\033[2J'
+  "$@"; rc=$?
+  [ "$rc" -eq 0 ] || TUI_MSG="${C_DIM}Last command exited with code $rc.${C_OFF}"
+  tui_pause
+}
+
+tui_menu() {
+  need_tools
+  local key
+  while :; do
+    tui_draw
+    read -rsn1 key || { say ""; return 0; }
+    say ""
+    case "$key" in
+      ""|1) tui_run start code ;;
+      2) tui_run start school ;;
+      3) tui_run start movie ;;
+      4) tui_run start mirror ;;
+      p|P) tui_run cmd_pair ;;
+      c|C) tui_run cmd_connect ;;
+      w|W) tui_run cmd_wifi ;;
+      k|K) tui_run cmd_keyboard ;;
+      d|D) tui_run cmd_doctor ;;
+      x|X) tui_run cmd_wake ;;
+      u|U) cmd_update; return $? ;;
+      h|H|'?') tui_run usage ;;
+      s|S)
+        case "$(cfg_get DEX_SCREEN)" in
+          dim) cfg_set DEX_SCREEN off; TUI_MSG="${C_WARN}Phone screen OFF while DeX runs. If DeX freezes on your phone, press x (wake) and switch back to on/dim.${C_OFF}" ;;
+          off) cfg_set DEX_SCREEN on; TUI_MSG="Phone screen stays ON while DeX runs (safest)." ;;
+          *) cfg_set DEX_SCREEN dim; TUI_MSG="Phone screen DIMMED while DeX runs (brightness restored on exit)." ;;
+        esac ;;
+      f|F)
+        if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then cfg_set DEX_FULLSCREEN 0; TUI_MSG="DeX starts in a resizable window (F11 toggles fullscreen)."
+        else cfg_set DEX_FULLSCREEN 1; TUI_MSG="DeX starts fullscreen at your monitor's resolution, like a real DeX monitor."; fi ;;
+      r|R)
+        local res dpi
+        read -r -p "  Window size WxH (empty = auto, 80% of screen): " res || true
+        read -r -p "  DPI (empty = profile default; 160 normal, 140 denser, 200 bigger): " dpi || true
+        case "$res" in ""|[0-9]*x[0-9]*) ;; *) TUI_MSG="${C_ERR}Size must look like 1600x900.${C_OFF}"; continue ;; esac
+        case "$dpi" in ""|[0-9]*) ;; *) TUI_MSG="${C_ERR}DPI must be a number.${C_OFF}"; continue ;; esac
+        cfg_set DEX_RES "$res"; cfg_set DEX_DPI "$dpi"; TUI_MSG="Saved." ;;
+      q|Q|$'\e'|$'\x03') say ""; return 0 ;;
+      *) TUI_MSG="${C_DIM}Unknown key '$key'. Press 1-4 to start DeX, q to quit.${C_OFF}" ;;
+    esac
+  done
+}
+
 # --- main -------------------------------------------------------------------------------
-MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN_OFF=0; OPT_FULLSCREEN=0; OPT_RAW=()
-CMD="code"
+MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_RAW=()
+CMD=""
 if [ $# -gt 0 ]; then
   case "$1" in -*) ;; *) CMD="$1"; shift ;; esac
 fi
@@ -420,8 +709,12 @@ while [ $# -gt 0 ]; do
     --dpi=*) OPT_DPI="${1#*=}"; shift ;;
     --usb) MODE=usb; shift ;;
     --wifi) MODE=wifi; shift ;;
-    --screen-off) OPT_SCREEN_OFF=1; shift ;;
+    --screen) [ $# -ge 2 ] || die "--screen needs on, dim or off"; OPT_SCREEN="$2"; shift 2 ;;
+    --screen=*) OPT_SCREEN="${1#*=}"; shift ;;
+    --screen-off) OPT_SCREEN=off; shift ;;
     --fullscreen) OPT_FULLSCREEN=1; shift ;;
+    --no-freeform) OPT_FREEFORM=0; shift ;;
+    --menu|--tui) CMD=menu; shift ;;
     -h|--help) CMD=help; shift ;;
     --) shift; OPT_RAW=("$@"); break ;;
     -*) die "Unknown option: $1 (see: dex help)" ;;
@@ -430,12 +723,20 @@ while [ $# -gt 0 ]; do
 done
 case "$OPT_RES" in ""|[0-9]*x[0-9]*) ;; *) die "--res must look like 1600x900" ;; esac
 case "$OPT_DPI" in ""|[0-9]*) ;; *) die "--dpi must be a number" ;; esac
+case "$OPT_SCREEN" in ""|on|dim|off) ;; *) die "--screen must be on, dim or off" ;; esac
+
+if [ -z "$CMD" ]; then
+  # No command: interactive menu on a terminal, otherwise the default profile (scripts, CI).
+  if [ -t 0 ] && [ -t 1 ] && [ "${DEX_NO_TUI:-0}" != 1 ]; then CMD=menu; else CMD=code; fi
+fi
 
 case "$CMD" in
+  menu) tui_menu ;;
   code|school|movie|mirror) start "$CMD" ;;
   pair) cmd_pair ;;
   connect) cmd_connect "${POS[0]:-}" ;;
   wifi) cmd_wifi ;;
+  wake) cmd_wake ;;
   keyboard) cmd_keyboard ;;
   doctor) cmd_doctor ;;
   update) cmd_update ;;

@@ -10,7 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck install.sh bin/dex
+        run: shellcheck install.sh bin/dex tests/fake-phone.sh
+      - name: fake-phone smoke test
+        run: bash tests/fake-phone.sh
       - name: PSScriptAnalyzer
         shell: pwsh
         run: |
@@ -28,6 +30,7 @@ jobs:
     env:
       DEX_SOURCE_DIR: ${{ github.workspace }}
       DEX_NO_SHORTCUT: "1"
+      DEX_NO_TUI: "1"
     steps:
       - uses: actions/checkout@v4
       - name: install (piped, like the one-liner)
@@ -56,6 +59,7 @@ jobs:
     runs-on: windows-latest
     env:
       DEX_SOURCE_DIR: ${{ github.workspace }}
+      DEX_NO_TUI: "1"
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -70,6 +74,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & "$env:LOCALAPPDATA\dex\bin\dex.cmd"
           Write-Host "dex without device exited $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 2) { exit 1 }
+          # dex.cmd always uses Windows PowerShell; also run dex.ps1 under this matrix shell (powershell / pwsh).
+          $exe = (Get-Process -Id $PID).Path
+          & $exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\dex\bin\dex.ps1" help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & $exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\dex\bin\dex.ps1" doctor
+          Write-Host "dex.ps1 doctor without device exited $LASTEXITCODE ($($PSVersionTable.PSVersion))"
           if ($LASTEXITCODE -ne 2) { exit 1 }
           exit 0
       - name: uninstall

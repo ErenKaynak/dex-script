@@ -1,255 +1,721 @@
-﻿# GNU-style arguments are intentionally parsed from $args.
+# GNU-style arguments are intentionally parsed from $args.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$root = if ($env:DEX_HOME) { $env:DEX_HOME } else { Join-Path $env:LOCALAPPDATA 'dex' }
-$configFile = Join-Path $env:APPDATA 'dex/config'
-$config = @{}
-if (Test-Path $configFile) {
-    foreach ($line in Get-Content $configFile) {
-        if ($line -match '^\s*([A-Z_]+)=(.*)$') { $config[$Matches[1]] = $Matches[2].Trim() }
+$script:root = if ($env:DEX_HOME) { $env:DEX_HOME } else { Join-Path $env:LOCALAPPDATA 'dex' }
+$script:configDir = if ($env:DEX_CONFIG_DIR) { $env:DEX_CONFIG_DIR } else { Join-Path $env:APPDATA 'dex' }
+$script:configFile = Join-Path $script:configDir 'config'
+$script:adb = if ($env:DEX_ADB) { $env:DEX_ADB } else { Join-Path $script:root 'scrcpy/adb.exe' }
+$script:scrcpy = if ($env:DEX_SCRCPY) { $env:DEX_SCRCPY } else { Join-Path $script:root 'scrcpy/scrcpy.exe' }
+$script:config = @{}
+if (Test-Path $script:configFile) {
+    foreach ($line in Get-Content $script:configFile) {
+        if ($line -match '^\s*([A-Z_]+)=(.*)$') { $script:config[$Matches[1]] = $Matches[2].Trim().Trim('"') }
     }
 }
+# Script state (phone selection, saved phone settings, menu state).
+$script:serial = ''; $script:transport = ''; $script:usbList = @(); $script:tcpList = @(); $script:unauth = @()
+$script:savedFf = ''; $script:savedBri = ''; $script:savedBriMode = ''; $script:lastConnectMsg = ''
+$script:tuiSeen = ''; $script:tuiModel = ''; $script:tuiMsg = @('', 'Gray'); $script:scrcpyVer = ''
+$script:adbExit = 0
+$script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Raw = @() }
+# Box drawing and marks need a UTF-8 console; fall back to ASCII otherwise.
+$utf8 = $false
+try { $utf8 = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { Write-Verbose 'No console encoding.' }
+if ($utf8) {
+    $script:bx = @{ TL = [string][char]0x256D; TR = [string][char]0x256E; BL = [string][char]0x2570; BR = [string][char]0x256F
+        H = [string][char]0x2500; V = [string][char]0x2502; ML = [string][char]0x251C; MR = [string][char]0x2524; Arrow = [string][char]0x203A }
+    $script:okMark = [string][char]0x2713; $script:errMark = [string][char]0x2717
+} else {
+    $script:bx = @{ TL = '+'; TR = '+'; BL = '+'; BR = '+'; H = '-'; V = '|'; ML = '+'; MR = '+'; Arrow = '>' }
+    $script:okMark = 'OK'; $script:errMark = 'x'
+}
+$script:boxW = 58
+function Write-Ok([string]$Message) { Write-Host "$($script:okMark) $Message" -ForegroundColor Green }
+function Write-Warn([string]$Message) { Write-Host "! $Message" -ForegroundColor Yellow }
+function Write-Err([string]$Message) { Write-Host "$($script:errMark) $Message" -ForegroundColor Red }
+function Get-Cfg([string]$Key) {
+    if ($script:config.ContainsKey($Key)) { return [string]$script:config[$Key] }
+    return ''
+}
 function Save-ConfigValue([string]$Key, [string]$Value) {
-    $config[$Key] = $Value
+    $script:config[$Key] = $Value
     $lines = @()
     $found = $false
-    if (Test-Path $configFile) {
-        foreach ($line in Get-Content $configFile) {
+    if (Test-Path $script:configFile) {
+        foreach ($line in Get-Content $script:configFile) {
             if ($line -match ('^\s*' + [regex]::Escape($Key) + '=')) {
                 if (!$found) { $lines += "$Key=$Value"; $found = $true }
             } else { $lines += $line }
         }
     }
     if (!$found) { $lines += "$Key=$Value" }
-    New-Item -ItemType Directory -Force -Path (Split-Path $configFile) | Out-Null
-    $tempConfig = "$configFile.$([guid]::NewGuid().ToString()).tmp"
-    try { Set-Content -LiteralPath $tempConfig -Value $lines -Encoding UTF8; Move-Item -LiteralPath $tempConfig -Destination $configFile -Force }
+    New-Item -ItemType Directory -Force -Path (Split-Path $script:configFile) | Out-Null
+    $tempConfig = "$($script:configFile).$([guid]::NewGuid().ToString()).tmp"
+    try { Set-Content -LiteralPath $tempConfig -Value $lines -Encoding UTF8; Move-Item -LiteralPath $tempConfig -Destination $script:configFile -Force }
     finally { if (Test-Path $tempConfig) { Remove-Item -LiteralPath $tempConfig -Force } }
 }
-function Show-Help {
-    Write-Host @'
-Usage: dex [code|school|movie|mirror|pair|connect [ip:port]|wifi|keyboard|doctor|update|uninstall|help] [options]
-Default: code. Options: --res WxH --dpi N --usb --wifi --screen-off --fullscreen -- [scrcpy args]
-Resize the DeX window freely. F11 / Alt+f: fullscreen. dex keyboard: choose Turkish Q.
-'@
+function Get-ExitCode($Value) {
+    $items = @($Value)
+    if ($items.Count -gt 0 -and $items[$items.Count - 1] -is [int]) { return $items[$items.Count - 1] }
+    return 0
 }
-function Invoke-Adb([string[]]$Arguments) {
+function Show-Help {
+    $text = @'
+dex - Samsung DeX in a window on your PC
+
+Usage: dex                       interactive menu (pick 1, 2, 3 ...)
+       dex [command] [options] [-- extra scrcpy args]
+
+Commands:
+  dex code           start DeX, profile "code" (crisp text, coding, browser)
+  dex school         start DeX, profile "school" (denser, Word/Excel side by side)
+  dex movie          start DeX, profile "movie" (high bitrate, H.265)
+  dex mirror         plain phone-screen mirror (no virtual display)
+  dex pair           wireless pairing without a cable
+  dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
+  dex wifi           switch a USB-connected phone to Wi-Fi
+  dex wake           wake the phone / unfreeze a stuck DeX window
+  dex keyboard       open phone keyboard settings (pick Turkish Q)
+  dex doctor         show versions, devices and phone info
+  dex update         re-run the installer (latest scripts)
+  dex uninstall      remove everything dex installed
+  dex help           this text
+
+Options (start commands):
+  --res WxH          initial window size (default: 80% of your screen)
+  --dpi N            DeX density (code 160, school 140, movie 160)
+  --usb / --wifi     force the transport
+  --screen on|dim|off  phone panel while DeX runs (default: on; see below)
+  --screen-off       same as --screen off
+  --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
+  --no-freeform      skip the One UI 8.5+/9 windowing fix
+  --                 pass everything after it to scrcpy
+
+Phone screen: "on" is the safe default (DeX never freezes). "dim" keeps the panel
+technically on but at minimum brightness and restores it afterwards. "off" turns the
+panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
+
+Config: {CONFIG}
+  DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
+  DEX_FREEFORM, DEX_LAST_ENDPOINT
+'@
+    $text = $text.Replace('{CONFIG}', $script:configFile)
+    Write-Host $text
+}
+function Test-ToolInstallation {
+    $env:ADB = $script:adb
+    if (!(Test-Path $script:adb) -or !(Test-Path $script:scrcpy)) { throw 'Bundled adb/scrcpy is missing. Re-run the installer (dex update).' }
+}
+# --- adb helpers ----------------------------------------------------------------
+function Invoke-Adb([string[]]$Arguments, [switch]$NoThrow) {
     # Windows PowerShell 5.1 turns native stderr into terminating errors under 'Stop'.
     $ErrorActionPreference = 'Continue'
     $result = @(& $script:adb @Arguments 2>&1 | ForEach-Object { "$_" })
-    if ($LASTEXITCODE -ne 0) { throw "adb failed: $($result -join ' ')" }
+    $script:adbExit = $LASTEXITCODE
+    if ($LASTEXITCODE -ne 0 -and !$NoThrow) { throw "adb failed: $($result -join ' ')" }
     return $result
 }
-function Get-DexDevice {
-    foreach ($line in @(Invoke-Adb @('devices'))) {
-        if ($line -match '^(\S+)\s+(device|unauthorized|offline)\b') {
-            if ($Matches[2] -eq 'device') { $Matches[1] }
-            elseif ($Matches[2] -eq 'unauthorized') { Write-Host 'Accept the "Allow USB debugging" prompt on your phone.' }
+function Invoke-Phone([string[]]$Cmd) {
+    try { $lines = @(Invoke-Adb -Arguments (@('-s', $script:serial, 'shell') + $Cmd) -NoThrow) } catch { return }
+    foreach ($l in $lines) { $l.Replace("`r", '') }
+}
+function Get-PhoneValue([string[]]$Cmd) {
+    $out = @(Invoke-Phone $Cmd)
+    if ($out.Count -gt 0) { return ([string]$out[0]).Trim() }
+    return ''
+}
+function Invoke-DeviceScan {
+    $script:usbList = @(); $script:tcpList = @(); $script:unauth = @()
+    foreach ($line in @(Invoke-Adb -Arguments @('devices', '-l') -NoThrow)) {
+        if ($line -match '^(\S+)\s+(device|unauthorized)\b') {
+            $s = $Matches[1]
+            if ($Matches[2] -eq 'unauthorized') { $script:unauth += $s }
+            elseif ($s -match ':' -or $s -match '_adb-tls-') { $script:tcpList += $s }
+            else { $script:usbList += $s }
         }
     }
 }
 function Find-Endpoint {
-    try {
-        foreach ($line in @(Invoke-Adb @('mdns', 'services'))) {
-            if ($line -match '_adb-tls-connect\._tcp\.?\s+(\S+:\d+)') { return $Matches[1] }
-        }
-    } catch { Write-Verbose $_ }
+    foreach ($line in @(Invoke-Adb -Arguments @('mdns', 'services') -NoThrow)) {
+        if ($line -match '_adb-tls-connect\._tcp\.?\s+(\S+:\d+)') { return $Matches[1] }
+    }
     return $null
+}
+function Test-Connect([string]$Endpoint) {
+    $text = @(Invoke-Adb -Arguments @('connect', $Endpoint) -NoThrow) -join ' '
+    if ($text -match 'connected to') { Save-ConfigValue 'DEX_LAST_ENDPOINT' $Endpoint; return $true }
+    $script:lastConnectMsg = $text
+    return $false
 }
 function Connect-Endpoint([string]$Endpoint) {
     if ($Endpoint -notmatch '^[^\s]+:\d+$') { throw 'Enter an endpoint in IP:port format.' }
-    $output = @(Invoke-Adb @('connect', $Endpoint))
-    if (($output -join ' ') -notmatch '(already )?connected to') { throw ($output -join ' ') }
-    Save-ConfigValue 'DEX_LAST_ENDPOINT' $Endpoint
-    Write-Host ($output -join "`n")
+    if (!(Test-Connect $Endpoint)) { throw $script:lastConnectMsg }
+}
+function Connect-DiscoveredEndpoint {
+    $ep = Find-Endpoint
+    if (!$ep) { return $false }
+    Write-Host "Found phone via mDNS: $ep"
+    return (Test-Connect $ep)
+}
+function Connect-Saved {
+    $ep = Get-Cfg 'DEX_LAST_ENDPOINT'
+    if (!$ep) { return $false }
+    Write-Host "Trying last endpoint $ep ..."
+    return (Test-Connect $ep)
 }
 function Show-WifiHint {
-    Write-Host 'Use the same Wi-Fi network. School Wi-Fi may isolate clients: use Windows Settings > Mobile hotspot (phone joins PC), or a USB cable.'
-    Write-Host 'A phone hotspot does not work: Wireless debugging requires the phone to be a Wi-Fi client.'
+    Write-Host 'Could not pair/connect. Check:'
+    Write-Host '  - Phone and PC are on the same Wi-Fi network.'
+    Write-Host '  - School Wi-Fi may isolate clients: use Windows Settings > Mobile hotspot (phone joins PC), or a USB cable.'
+    Write-Host '  - A phone hotspot does NOT work: Wireless debugging needs the phone to be a Wi-Fi client.'
 }
-try {
-    $command = 'code'
-    $position = 0
-    if ($args.Count -gt 0 -and !$args[0].StartsWith('-')) { $command = $args[0]; $position = 1 }
-    if ($args.Count -gt 0 -and $args[0] -in @('-h', '--help')) { $command = 'help'; $position = 1 }
-    $valid = @('code','school','movie','mirror','pair','connect','wifi','keyboard','doctor','update','uninstall','help')
-    if ($command -notin $valid) { throw "Unknown command: $command. Run: dex help" }
-    $res = $config['DEX_RES']; $dpi = $config['DEX_DPI']
-    $usb = $false; $wifi = $false; $screenOff = $false; $fullscreen = $false
-    $extra = @(); $endpoint = $null
-    $starts = @('code','school','movie','mirror')
-    while ($position -lt $args.Count) {
-        $arg = $args[$position]; $position++
-        if ($command -eq 'connect' -and !$arg.StartsWith('-') -and !$endpoint) { $endpoint = $arg; continue }
-        if ($command -notin $starts) { throw "Unexpected argument: $arg" }
-        switch ($arg) {
-            '--' { $extra = @($args | Select-Object -Skip $position); $position = $args.Count }
-            '--res' { if ($position -ge $args.Count) { throw '--res requires WxH.' }; $res = $args[$position]; $position++ }
-            '--dpi' { if ($position -ge $args.Count) { throw '--dpi requires a positive number.' }; $dpi = $args[$position]; $position++ }
-            '--usb' { $usb = $true }
-            '--wifi' { $wifi = $true }
-            '--screen-off' { $screenOff = $true }
-            '--fullscreen' { $fullscreen = $true }
-            default { throw "Unknown option: $arg. Run: dex help" }
+function Show-NoDevice {
+    if ($script:unauth.Count -gt 0) {
+        Write-Err ('Phone {0} is unauthorized: accept the "Allow USB debugging" prompt on the phone, then retry.' -f $script:unauth[0])
+    }
+    Write-Err 'No phone found.'
+    Write-Host 'Options:'
+    Write-Host '  1. Plug in the USB cable (and accept "Allow USB debugging" on the phone).'
+    Write-Host '  2. dex pair   - pair wirelessly (Wireless debugging), no cable needed.'
+    Write-Host '  3. dex wifi   - with the cable plugged in, switch the connection to Wi-Fi.'
+    Write-Host 'USB not detected on Windows? Install the Samsung USB driver (needs admin) or use Wi-Fi: dex pair'
+}
+# Sets $script:serial / $script:transport (usb|wifi); returns 2 if there is no usable phone.
+function Select-Device([string]$Mode) {
+    $script:serial = ''; $script:transport = ''
+    Invoke-DeviceScan
+    if ($Mode -ne 'wifi' -and $script:usbList.Count -gt 0) {
+        $script:serial = $script:usbList[0]; $script:transport = 'usb'
+        if ($script:usbList.Count -gt 1) { Write-Host "Several USB devices; using $($script:serial)" }
+        return 0
+    }
+    if ($Mode -eq 'usb') { Show-NoDevice; return 2 }
+    if ($script:tcpList.Count -eq 0) {
+        if ((Connect-DiscoveredEndpoint) -or (Connect-Saved)) { Invoke-DeviceScan }
+    }
+    if ($script:tcpList.Count -gt 0) {
+        $script:serial = $script:tcpList[0]; $script:transport = 'wifi'
+        if ($script:tcpList.Count -gt 1) { Write-Host "Several Wi-Fi devices; using $($script:serial)" }
+        return 0
+    }
+    Show-NoDevice
+    return 2
+}
+# --- phone state ------------------------------------------------------------------
+# One UI 8.5 / 9 (Android 16 QPR2+) no longer enables desktop windowing on app-created virtual
+# displays: DeX starts, but every app opens fullscreen. The per-display windowing mode can be
+# forced with a shell command (5 = WINDOWING_MODE_FREEFORM); One UI 8.0 does not need it.
+function Enable-Freeform([string]$DisplayId) {
+    Invoke-Adb -Arguments @('-s', $script:serial, 'shell', 'wm', 'set-display-windowing-mode', '-d', $DisplayId, '5') -NoThrow | Out-Null
+    if ($script:adbExit -eq 0) {
+        Write-Ok "Desktop windowing enabled on DeX display $DisplayId (apps open as movable windows)."
+    } else {
+        Write-Host "Display ${DisplayId}: windowing-mode command not available (One UI 8.0?), freeform should already be on." -ForegroundColor DarkGray
+    }
+}
+function Get-Wakefulness {
+    foreach ($l in @(Invoke-Phone @('dumpsys', 'power'))) {
+        if ($l -match 'mWakefulness=([A-Za-z]+)') { return $Matches[1] }
+    }
+    return ''
+}
+# A sleeping/dozing phone never renders the new virtual display (nothing or a frozen frame).
+function Invoke-WakePhone {
+    if ((Get-Wakefulness) -in @('Asleep', 'Dozing')) {
+        Write-Host 'Waking the phone...'
+        Invoke-Phone @('input', 'keyevent', 'KEYCODE_WAKEUP') | Out-Null
+        Start-Sleep -Seconds 1
+    }
+    $inKeyguard = $false
+    foreach ($l in @(Invoke-Phone @('dumpsys', 'window', 'policy'))) {
+        if ($l -match 'KeyguardServiceDelegate') { $inKeyguard = $true }
+        if ($inKeyguard -and $l -match 'showing=true') {
+            Write-Warn 'The phone is locked. Unlock it, or DeX shows only the lock screen (Samsung also hides the dock while locked).'
+            break
         }
     }
-    if ($usb -and $wifi) { throw 'Choose either --usb or --wifi.' }
-    if ($res -and $res -notmatch '^[1-9]\d*x[1-9]\d*$') { throw '--res requires WxH, for example 1600x900.' }
-    if ($dpi -and $dpi -notmatch '^[1-9]\d*$') { throw '--dpi requires a positive integer.' }
-    if ($command -eq 'help') { Show-Help; exit 0 }
-    if ($command -eq 'update') {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $repo = if ($env:DEX_REPO) { $env:DEX_REPO } else { 'ErenKaynak/dex-script' }
-        $installer = Join-Path ([IO.Path]::GetTempPath()) ("dex-install-" + [guid]::NewGuid().ToString() + '.ps1')
-        try {
-            Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$repo/main/install.ps1" -OutFile $installer
-            $global:LASTEXITCODE = 0
-            & $installer
-            if ($LASTEXITCODE -ne 0) { throw 'The installer failed.' }
-        } finally { if (Test-Path $installer) { Remove-Item -LiteralPath $installer -Force } }
-        exit 0
+}
+function Invoke-DimOn {
+    $script:savedBri = Get-PhoneValue @('settings', 'get', 'system', 'screen_brightness')
+    $script:savedBriMode = Get-PhoneValue @('settings', 'get', 'system', 'screen_brightness_mode')
+    Invoke-Phone @('settings', 'put', 'system', 'screen_brightness_mode', '0') | Out-Null
+    Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', '0') | Out-Null
+    Write-Host 'Phone screen dimmed (restored when DeX closes).' -ForegroundColor DarkGray
+}
+function Invoke-FreeformSupportOn {
+    $v = Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')
+    if ($v -eq '1') { $script:savedFf = ''; return }
+    if ($v -match '^(null|\d+)$') { $script:savedFf = $v } else { $script:savedFf = '' }
+    Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', '1') | Out-Null
+}
+function Invoke-PhoneRestore {
+    if ($script:savedBri -match '^\d+$') { Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', $script:savedBri) | Out-Null }
+    if ($script:savedBriMode -match '^\d+$') { Invoke-Phone @('settings', 'put', 'system', 'screen_brightness_mode', $script:savedBriMode) | Out-Null }
+    if ($script:savedFf -eq 'null') { Invoke-Phone @('settings', 'delete', 'global', 'enable_freeform_support') | Out-Null }
+    elseif ($script:savedFf) { Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', $script:savedFf) | Out-Null }
+    $script:savedBri = ''; $script:savedBriMode = ''; $script:savedFf = ''
+}
+function Get-OneUi {
+    $v = Get-PhoneValue @('getprop', 'ro.build.version.oneui')
+    if ($v -match '^\d+$') {
+        $n = [int]$v
+        return ('{0}.{1}' -f [math]::Floor($n / 10000), [math]::Floor(($n % 10000) / 100))
     }
-    if ($command -eq 'uninstall') {
-        $bin = Join-Path $root 'bin'
-        foreach ($scope in @('User', 'Process')) {
-            $pathValue = [Environment]::GetEnvironmentVariable('Path', $scope)
-            $clean = @($pathValue -split ';' | Where-Object { $_.TrimEnd('\') -ine $bin.TrimEnd('\') }) -join ';'
-            [Environment]::SetEnvironmentVariable('Path', $clean, $scope)
-        }
-        foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {
-            $link = Join-Path $folder 'Galaxy DeX.lnk'
-            if (Test-Path $link) { Remove-Item -LiteralPath $link -Force }
-        }
-        $bundledAdb = Join-Path $root 'scrcpy/adb.exe'
-        if (Test-Path $bundledAdb) { $ErrorActionPreference = 'Continue'; & $bundledAdb kill-server 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
-        # Remove only what dex created; DEX_HOME may point at a shared folder.
-        $scrcpyDir = Join-Path $root 'scrcpy'
-        if (Test-Path $scrcpyDir) { Remove-Item -LiteralPath $scrcpyDir -Recurse -Force }
-        # bin holds the running dex.cmd; cmd re-reads it after we exit, so delete it a moment later.
-        $cleanup = 'ping -n 3 127.0.0.1 >nul & rmdir /s /q "' + $bin + '" & rmdir "' + $root + '"'
-        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList @('/c', $cleanup) -WindowStyle Hidden
-        if (Test-Path (Split-Path $configFile)) { Remove-Item -LiteralPath (Split-Path $configFile) -Recurse -Force }
-        Write-Host 'Galaxy DeX uninstalled.'; exit 0
-    }
-    $adb = Join-Path $root 'scrcpy/adb.exe'
-    $scrcpy = Join-Path $root 'scrcpy/scrcpy.exe'
-    $env:ADB = $adb
-    if (!(Test-Path $adb) -or !(Test-Path $scrcpy)) { throw 'Bundled adb/scrcpy is missing. Re-run the installer.' }
-    switch ($command) {
-        'pair' {
-            Write-Host 'Phone > Settings > Developer options > Wireless debugging ON > Pair device with pairing code.'
-            try {
-                $pairEndpoint = Read-Host 'IP:port in pairing dialog'
-                $code = Read-Host '6-digit pairing code'
-                if ($pairEndpoint -notmatch '^[^\s]+:\d+$' -or $code -notmatch '^\d{6}$') { throw 'Enter IP:port and a 6-digit pairing code.' }
-                Invoke-Adb @('pair', $pairEndpoint, $code) | ForEach-Object { Write-Host $_ }
-                $endpoint = Find-Endpoint
-                if (!$endpoint) { $endpoint = Read-Host 'Connect IP address & Port on Wireless debugging main screen (different from pairing port)' }
-                Connect-Endpoint $endpoint
-            } catch { Show-WifiHint; throw }
-            exit 0
-        }
-        'connect' {
-            try {
-                if (!$endpoint) { $endpoint = Find-Endpoint }
-                if (!$endpoint) { $endpoint = $config['DEX_LAST_ENDPOINT'] }
-                if (!$endpoint) { $endpoint = Read-Host 'Wireless debugging IP address & Port' }
-                Connect-Endpoint $endpoint
-            } catch { Show-WifiHint; throw }
-            exit 0
-        }
-        'doctor' {
-            & $scrcpy --version
-            Invoke-Adb @('version') | ForEach-Object { Write-Host $_ }
-            Invoke-Adb @('devices','-l') | ForEach-Object { Write-Host $_ }
+    return ''
+}
+function Get-ScrcpyLine {
+    $ErrorActionPreference = 'Continue'
+    try {
+        $l = @(& $script:scrcpy --version 2>&1 | ForEach-Object { "$_" })
+        if ($l.Count -gt 0) { return $l[0] }
+    } catch { Write-Verbose 'scrcpy is not runnable.' }
+    return 'not runnable'
+}
+function Get-DefaultResolution([int]$Percent) {
+    $w = 0; $h = 0
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $rect = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        if ($Percent -ge 100) { $rect = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds }
+        $w = [int]([math]::Floor($rect.Width * $Percent / 100 / 8) * 8)
+        $h = [int]([math]::Floor($rect.Height * $Percent / 100 / 8) * 8)
+    } catch { Write-Verbose 'Screen detection unavailable.' }
+    if ($w -ge 640 -and $h -ge 480) { return "${w}x${h}" }
+    if ($Percent -ge 100) { return '1920x1080' }
+    return '1600x900'
+}
+# Runs scrcpy with its output streamed live and watched line by line; applies the freeform fix as
+# soon as the virtual display exists. Returns scrcpy's real exit code.
+function Invoke-Scrcpy([string[]]$ScrcpyArgs, [bool]$Watch) {
+    $ErrorActionPreference = 'Continue'
+    & $script:scrcpy @ScrcpyArgs 2>&1 | ForEach-Object {
+        $text = "$_"
+        Write-Host $text
+        if ($Watch -and $text -match 'New display:.*\(id=(\d+)\)') {
+            $displayId = $Matches[1]
+            Enable-Freeform $displayId
         }
     }
-    $devices = @(Get-DexDevice)
-    $usbDevices = @($devices | Where-Object { $_ -notmatch ':' -and $_ -notmatch '_adb-tls-' })
-    $tcpDevices = @($devices | Where-Object { $_ -notin $usbDevices })
-    $serial = $null
-    if ($command -eq 'wifi') { $usb = $true }
-    if (!$wifi -and $usbDevices.Count -gt 0) { $serial = $usbDevices[0] }
-    elseif (!$usb) {
-        if ($tcpDevices.Count -gt 0) { $serial = $tcpDevices[0] }
-        else {
-            $candidates = @((Find-Endpoint), $config['DEX_LAST_ENDPOINT']) | Where-Object { $_ }
-            foreach ($candidate in $candidates) {
-                try {
-                    Connect-Endpoint $candidate
-                    $connected = @(Get-DexDevice | Where-Object { $_ -eq $candidate -or $_ -match ':' -or $_ -match '_adb-tls-' })
-                    if ($connected.Count -gt 0) { $serial = $connected[0]; break }
-                } catch { Write-Host $_.Exception.Message }
-            }
-        }
-    }
-    if (!$serial) {
-        Write-Host 'No device. Plug in a USB cable, run dex pair, or plug USB and run dex wifi.'
-        Write-Host 'USB not detected on Windows? Install the Samsung USB driver (needs admin) or use Wi-Fi: dex pair'
-        exit 2
-    }
-    if ($devices.Count -gt 1) { Write-Host "Using device: $serial" }
-    if ($command -eq 'wifi') {
-        $address = (Invoke-Adb @('-s',$serial,'shell','ip','-f','inet','addr','show','wlan0')) -join ' '
-        if ($address -notmatch '\binet\s+(\d+\.\d+\.\d+\.\d+)/') { throw 'Cannot find phone Wi-Fi IP. Connect the phone to Wi-Fi first.' }
-        $endpoint = $Matches[1] + ':5555'
-        Invoke-Adb @('-s',$serial,'tcpip','5555') | ForEach-Object { Write-Host $_ }
-        Connect-Endpoint $endpoint
-        Write-Host 'Unplug USB now. This connection lasts until the phone reboots.'; exit 0
-    }
-    if ($command -eq 'keyboard') {
-        Invoke-Adb @('-s',$serial,'shell','am','start','-a','android.settings.HARD_KEYBOARD_SETTINGS') | ForEach-Object { Write-Host $_ }
-        Write-Host 'Choose Turkish Q for the physical keyboard.'; exit 0
-    }
-    if ($command -eq 'doctor') {
-        foreach ($property in @('ro.product.model','ro.build.version.sdk','ro.build.version.oneui')) {
-            $value = (Invoke-Adb @('-s',$serial,'shell','getprop',$property)) -join ''
-            Write-Host "${property}: $value"
-            if ($property -eq 'ro.build.version.oneui' -and $value -match '^\d+$') {
-                $oneUi = [int]$value
-                Write-Host ('One UI: {0}.{1}' -f [math]::Floor($oneUi / 10000), ([math]::Floor($oneUi / 100) % 100))
-                if ($oneUi -lt 80000) { Write-Host 'Warning: DeX on a virtual display requires One UI 8+.' }
-            }
-        }
-        exit 0
-    }
-    if (!$config['DEX_KEYBOARD_HINT_SHOWN']) {
-        Write-Host 'Keyboard tip: run dex keyboard and choose Turkish Q once.'
+    return $LASTEXITCODE
+}
+# --- start ------------------------------------------------------------------------
+function Invoke-DexStart([string]$Kind) {
+    Test-ToolInstallation
+    $rc = Select-Device $script:opt.Mode
+    if ($rc -ne 0) { return $rc }
+    if (!(Get-Cfg 'DEX_KEYBOARD_HINT_SHOWN')) {
+        Write-Host "Tip: for the Turkish Q layout run 'dex keyboard' once (physical keyboard settings on the phone)."
         Save-ConfigValue 'DEX_KEYBOARD_HINT_SHOWN' '1'
     }
-    if (!$res) {
-        $res = '1600x900'
-        try {
-            Add-Type -AssemblyName System.Windows.Forms
-            $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $res = '{0}x{1}' -f ([math]::Floor($area.Width * 0.8 / 8) * 8), ([math]::Floor($area.Height * 0.8 / 8) * 8)
-        } catch { Write-Verbose 'Screen detection unavailable; using 1600x900.' }
-    }
-    if (!$dpi) { $dpi = if ($command -eq 'school') { '140' } else { '160' } }
-    $scrcpyArgs = @('-s', $serial)
-    if ($command -eq 'mirror') { $scrcpyArgs += @('--video-bit-rate=12M','--max-fps=60','--keyboard=uhid') }
-    else {
-        $mod = if ($config['DEX_SHORTCUT_MOD']) { $config['DEX_SHORTCUT_MOD'] } else { 'lalt' }
-        $rate = switch ($command) { 'school' { 12 }; 'movie' { 24 }; default { 16 } }
-        if ($serial -notin $usbDevices) { $rate = $rate / 2 }
-        $scrcpyArgs += @("--new-display=$res/$dpi",'--flex-display','--no-vd-destroy-content','--keyboard=uhid','--mouse=sdk','--mouse-bind=++++:bhsn',"--window-title=Galaxy DeX ($command)","--shortcut-mod=$mod",'--video-codec=h264','--disable-screensaver','--max-fps=60',"--video-bit-rate=${rate}M")
-        if ($serial -in $usbDevices) { $scrcpyArgs += '--stay-awake' }
-        if ($command -eq 'movie') {
-            $scrcpyArgs = @($scrcpyArgs | Where-Object { $_ -ne '--video-codec=h264' })
-            $scrcpyArgs += @('--video-codec=h265','--audio-buffer=80')
-            Write-Host 'Netflix / Disney+ / Prime use DRM: video stays black inside a PC window (Android blocks capture of protected content). For DRM content use a USB-C to HDMI cable/hub to a monitor/TV (real DeX), Wireless DeX to a smart TV, or the streaming site in the PC''s browser. YouTube, local files, Plex/Jellyfin work fine here.'
+    $codec = 'h264'; $extraProfile = @()
+    switch ($Kind) {
+        'code' { $bitrate = 16 }
+        'school' { $bitrate = 12 }
+        'movie' {
+            $bitrate = 24; $codec = 'h265'; $extraProfile = @('--audio-buffer=80')
+            Write-Host 'Netflix / Disney+ / Prime use DRM: video stays black inside a PC window (Android'
+            Write-Host 'blocks capture of protected content). For DRM content use a USB-C to HDMI cable/hub to a'
+            Write-Host "monitor/TV (real DeX), Wireless DeX to a smart TV, or the streaming site in the PC's"
+            Write-Host 'browser. YouTube, local files, Plex/Jellyfin work fine here.'
         }
+        default { $bitrate = 12 }
     }
-    if ($screenOff) { $scrcpyArgs += '--turn-screen-off' }
-    if ($fullscreen) { $scrcpyArgs += '--fullscreen' }
-    if ($config['DEX_EXTRA_ARGS']) {
+    if ($script:transport -eq 'wifi') { $bitrate = [int]($bitrate / 2) }
+    $fullscreen = $script:opt.Fullscreen
+    if (!$fullscreen) { $fullscreen = Get-Cfg 'DEX_FULLSCREEN' }
+    $res = $script:opt.Res
+    if (!$res) { $res = Get-Cfg 'DEX_RES' }
+    if (!$res) { $res = if ($fullscreen -eq '1') { Get-DefaultResolution 100 } else { Get-DefaultResolution 80 } }
+    $dpi = $script:opt.Dpi
+    if (!$dpi) { $dpi = Get-Cfg 'DEX_DPI' }
+    if (!$dpi) { $dpi = if ($Kind -eq 'school') { '140' } else { '160' } }
+    $mod = Get-Cfg 'DEX_SHORTCUT_MOD'
+    if (!$mod) { $mod = 'lalt' }
+    $screen = $script:opt.Screen
+    if (!$screen) { $screen = Get-Cfg 'DEX_SCREEN' }
+    if ($screen -notin @('on', 'dim', 'off')) { $screen = 'on' }
+    $freeform = $script:opt.Freeform
+    if (!$freeform) { $freeform = Get-Cfg 'DEX_FREEFORM' }
+    $watch = ($freeform -ne '0' -and $Kind -ne 'mirror') # mirror has no virtual display to fix
+
+    $scrcpyArgs = @('-s', $script:serial)
+    if ($Kind -ne 'mirror') {
+        $scrcpyArgs += @("--new-display=$res/$dpi", '--flex-display', '--no-vd-destroy-content', '--keyboard=uhid', '--mouse=sdk', '--mouse-bind=++++:bhsn')
+    }
+    $scrcpyArgs += @("--window-title=Galaxy DeX ($Kind)", "--shortcut-mod=$mod")
+    # --keep-active keeps the phone awake on USB and Wi-Fi; --stay-awake only works when plugged in.
+    $scrcpyArgs += @('--keep-active', '--disable-screensaver', '--max-fps=60', "--video-bit-rate=${bitrate}M")
+    if ($script:transport -eq 'usb') { $scrcpyArgs += '--stay-awake' }
+    if ($script:transport -eq 'wifi') { $scrcpyArgs += '--video-buffer=50' } # absorbs Wi-Fi jitter
+    if ($Kind -eq 'mirror') { $scrcpyArgs += '--keyboard=uhid' } else { $scrcpyArgs += @("--video-codec=$codec") + $extraProfile }
+    if ($screen -eq 'off') { $scrcpyArgs += '--turn-screen-off' }
+    if ($fullscreen -eq '1') { $scrcpyArgs += '--fullscreen' }
+    $cfgExtra = Get-Cfg 'DEX_EXTRA_ARGS'
+    if ($cfgExtra) {
         # Tokenize quoted arguments without evaluating config as PowerShell code.
-        foreach ($match in [regex]::Matches($config['DEX_EXTRA_ARGS'], '(?:[^\s"'']+|"[^"]*"|''[^'']*'')+')) {
+        foreach ($match in [regex]::Matches($cfgExtra, '(?:[^\s"'']+|"[^"]*"|''[^'']*'')+')) {
             $scrcpyArgs += ($match.Value -replace '"([^"]*)"|''([^'']*)''', '$1$2')
         }
     }
-    $scrcpyArgs += $extra
-    & $scrcpy @scrcpyArgs
-    if ($LASTEXITCODE -ne 0) { exit 1 }
+    $scrcpyArgs += @($script:opt.Raw)
+    if ($env:DEX_DRY_RUN -eq '1') { Write-Host ('scrcpy ' + ($scrcpyArgs -join ' ')); return 0 }
+
+    Invoke-WakePhone
+    try {
+        if ($watch) { Invoke-FreeformSupportOn }
+        if ($screen -eq 'dim') { Invoke-DimOn }
+        Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen)..."
+        Write-Host 'Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake' -ForegroundColor DarkGray
+        $code = Get-ExitCode (Invoke-Scrcpy $scrcpyArgs $watch)
+    } finally { Invoke-PhoneRestore } # also runs on Ctrl+C
+    if ($code -eq 0) { Write-Ok 'DeX closed. Your apps moved back to the phone.' }
+    elseif ($code -eq 2) { Write-Warn 'The phone disconnected (cable unplugged, Wi-Fi dropped or the phone slept).' }
+    else { Write-Err "scrcpy exited with code $code." }
+    return $code
+}
+# --- other commands ---------------------------------------------------------------
+function Invoke-Pair {
+    Test-ToolInstallation
+    Write-Host 'Pair without a cable:'
+    Write-Host '  Phone > Settings > Developer options > Wireless debugging ON'
+    Write-Host '  > "Pair device with pairing code".'
+    try {
+        $pairEndpoint = Read-Host 'Pairing IP:port (shown in the dialog)'
+        $pairCode = Read-Host '6-digit pairing code'
+        if ($pairEndpoint -notmatch '^[^\s]+:\d+$' -or $pairCode -notmatch '^\d{6}$') { throw 'Enter IP:port and a 6-digit pairing code.' }
+        foreach ($l in @(Invoke-Adb -Arguments @('pair', $pairEndpoint, $pairCode))) { Write-Host $l }
+        Write-Host 'Paired. Now the connect port (Wireless debugging main screen: "IP address & Port").'
+        if (!(Connect-DiscoveredEndpoint)) { Connect-Endpoint (Read-Host 'Connect IP:port') }
+        Write-Ok 'Connected. Run: dex'
+        return 0
+    } catch { Show-WifiHint; throw }
+}
+function Invoke-ConnectCmd([string]$Endpoint) {
+    Test-ToolInstallation
+    try {
+        if (!$Endpoint) {
+            if (Connect-DiscoveredEndpoint) { Write-Ok 'Connected.'; return 0 }
+            $Endpoint = Get-Cfg 'DEX_LAST_ENDPOINT'
+        }
+        if (!$Endpoint) { $Endpoint = Read-Host 'Phone IP:port (Wireless debugging screen)' }
+        if ($Endpoint -notmatch ':') { $Endpoint = "${Endpoint}:5555" }
+        Connect-Endpoint $Endpoint
+        Write-Ok "Connected to $Endpoint. Run: dex"
+        return 0
+    } catch { Show-WifiHint; throw }
+}
+function Invoke-Wifi {
+    Test-ToolInstallation
+    Invoke-DeviceScan
+    if ($script:usbList.Count -eq 0) {
+        if ($script:unauth.Count -gt 0) { Show-NoDevice } else { Write-Err 'Plug the phone in with USB first.' }
+        return 2
+    }
+    $s = $script:usbList[0]
+    $address = @(Invoke-Adb -Arguments @('-s', $s, 'shell', 'ip', '-f', 'inet', 'addr', 'show', 'wlan0') -NoThrow) -join ' '
+    if ($address -match '\binet\s+(\d+\.\d+\.\d+\.\d+)/') { $endpoint = $Matches[1] + ':5555' }
+    else { Write-Err "Could not read the phone's Wi-Fi IP. Is Wi-Fi on?"; return 1 }
+    Invoke-Adb -Arguments @('-s', $s, 'tcpip', '5555') | Out-Null
+    Start-Sleep -Seconds 2
+    Connect-Endpoint $endpoint
+    Write-Ok "Connected over Wi-Fi ($endpoint). You can unplug the cable (works until the phone reboots)."
+    return 0
+}
+function Invoke-Wake {
+    Test-ToolInstallation
+    $rc = Select-Device $script:opt.Mode
+    if ($rc -ne 0) { return $rc }
+    # -d 0 targets the phone panel (Android 14+ needs the display id), the second call is the fallback.
+    Invoke-Phone @('input', '-d', '0', 'keyevent', 'KEYCODE_WAKEUP') | Out-Null
+    Invoke-Phone @('input', 'keyevent', 'KEYCODE_WAKEUP') | Out-Null
+    Write-Ok 'Wake-up sent. If the DeX window is still frozen: unlock the phone, or press Alt+Shift+r in the window.'
+    return 0
+}
+function Invoke-Keyboard {
+    Test-ToolInstallation
+    $rc = Select-Device $script:opt.Mode
+    if ($rc -ne 0) { return $rc }
+    Invoke-Adb -Arguments @('-s', $script:serial, 'shell', 'am', 'start', '-a', 'android.settings.HARD_KEYBOARD_SETTINGS') | Out-Null
+    Write-Ok 'Opened the keyboard settings on the phone. Pick Turkish Q as the layout.'
+    return 0
+}
+function Invoke-Doctor {
+    Test-ToolInstallation
+    Write-Host "scrcpy: $(Get-ScrcpyLine)"
+    $versionLine = @(Invoke-Adb -Arguments @('version') -NoThrow)
+    Write-Host ('adb:    ' + $(if ($versionLine.Count -gt 0) { $versionLine[0] } else { 'not runnable' }))
+    Write-Host 'devices:'
+    foreach ($l in @(Invoke-Adb -Arguments @('devices', '-l') -NoThrow)) { Write-Host "  $l" }
+    Invoke-DeviceScan
+    $all = @($script:usbList) + @($script:tcpList)
+    if ($all.Count -eq 0) { Show-NoDevice; return 2 }
+    $script:serial = $all[0]
+    $model = Get-PhoneValue @('getprop', 'ro.product.model')
+    $sdk = Get-PhoneValue @('getprop', 'ro.build.version.sdk')
+    if (!$model) { $model = 'unknown' }
+    if (!$sdk) { $sdk = '?' }
+    Write-Host "phone:   $model (Android SDK $sdk)"
+    $ui = Get-OneUi
+    if ($ui) {
+        Write-Host "One UI:  $ui"
+        if ([int]$ui.Split('.')[0] -lt 8) {
+            Write-Warn "One UI $ui is too old: DeX on a virtual display needs One UI 8+."
+        } else {
+            Write-Ok 'One UI 8+ detected.'
+            if ($ui -eq '8.0') { Write-Host 'One UI 8.0: desktop windowing works out of the box.' }
+            else { Write-Host 'One UI 8.5+/9: dex forces desktop windowing on the DeX display at start (the fix for fullscreen-only apps).' }
+        }
+    } else {
+        Write-Warn 'Could not read One UI version (not a Samsung phone, or One UI < 8?).'
+    }
+    $wk = Get-Wakefulness
+    if ($wk) { Write-Host "power:   $wk" }
+    Write-Host ('freeform support: ' + (Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')))
+    return 0
+}
+function Invoke-Update {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $installer = ''
+    if ($env:DEX_SOURCE_DIR) { $installer = Join-Path $env:DEX_SOURCE_DIR 'install.ps1' }
+    $downloaded = $false
+    if (!$installer -or !(Test-Path -LiteralPath $installer)) {
+        $repo = if ($env:DEX_REPO) { $env:DEX_REPO } else { 'ErenKaynak/dex-script' }
+        $installer = Join-Path ([IO.Path]::GetTempPath()) ("dex-install-" + [guid]::NewGuid().ToString() + '.ps1')
+        $downloaded = $true
+    }
+    try {
+        if ($downloaded) { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$repo/main/install.ps1" -OutFile $installer }
+        $global:LASTEXITCODE = 0
+        & $installer
+        if ($LASTEXITCODE -ne 0) { throw 'The installer failed.' }
+    } finally { if ($downloaded -and (Test-Path $installer)) { Remove-Item -LiteralPath $installer -Force } }
+    return 0
+}
+function Invoke-Uninstall {
+    $bin = Join-Path $script:root 'bin'
+    foreach ($scope in @('User', 'Process')) {
+        $pathValue = [Environment]::GetEnvironmentVariable('Path', $scope)
+        $clean = @($pathValue -split ';' | Where-Object { $_.TrimEnd('\') -ine $bin.TrimEnd('\') }) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $clean, $scope)
+    }
+    foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {
+        $link = Join-Path $folder 'Galaxy DeX.lnk'
+        if (Test-Path $link) { Remove-Item -LiteralPath $link -Force }
+    }
+    $bundledAdb = Join-Path $script:root 'scrcpy/adb.exe'
+    if (Test-Path $bundledAdb) { $ErrorActionPreference = 'Continue'; & $bundledAdb kill-server 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
+    # Remove only what dex created; DEX_HOME may point at a shared folder.
+    $scrcpyDir = Join-Path $script:root 'scrcpy'
+    if (Test-Path $scrcpyDir) { Remove-Item -LiteralPath $scrcpyDir -Recurse -Force }
+    # bin holds the running dex.cmd; cmd re-reads it after we exit, so delete it a moment later.
+    $cleanup = 'ping -n 3 127.0.0.1 >nul & rmdir /s /q "' + $bin + '" & rmdir "' + $script:root + '"'
+    Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList @('/c', $cleanup) -WindowStyle Hidden
+    if (Test-Path $script:configDir) { Remove-Item -LiteralPath $script:configDir -Recurse -Force }
+    Write-Ok 'dex removed.'
     exit 0
+}
+# --- interactive menu (TUI) -------------------------------------------------------
+function Test-Interactive {
+    if ($env:DEX_NO_TUI -eq '1') { return $false }
+    if (![Environment]::UserInteractive) { return $false }
+    try { return (!([Console]::IsInputRedirected) -and !([Console]::IsOutputRedirected)) } catch { return $false }
+}
+function Clear-Screen { try { Clear-Host } catch { Write-Verbose 'Cannot clear the screen.' } }
+function Write-BoxLine([string]$Left, [string]$Right) {
+    Write-Host ('  ' + $Left + ($script:bx.H * $script:boxW) + $Right) -ForegroundColor Cyan
+}
+function Write-BoxRow([string]$Text, [string]$Color = '') {
+    $width = $script:boxW - 2
+    if ($Text.Length -gt $width) { $Text = $Text.Substring(0, $width) }
+    $style = @{}
+    if ($Color) { $style.ForegroundColor = $Color }
+    Write-Host ('  ' + $script:bx.V) -NoNewline -ForegroundColor Cyan
+    Write-Host (' ' + $Text.PadRight($width) + ' ') -NoNewline @style
+    Write-Host $script:bx.V -ForegroundColor Cyan
+}
+function Write-BoxItem([string]$Key, [string]$Label, [string]$Desc) {
+    Write-BoxRow (' {0,-2} {1,-9} {2}' -f $Key, $Label, $Desc)
+}
+function Write-BoxKv([string]$Label, [string]$Value, [string]$Right = '') {
+    $left = '{0,-9} {1}' -f $Label, $Value
+    Write-BoxRow ($left.PadRight([math]::Max(0, $script:boxW - 2 - $Right.Length)) + $Right) 'DarkGray'
+}
+function Get-TuiPhone {
+    Invoke-DeviceScan
+    $s = ''; $via = ''
+    if ($script:usbList.Count -gt 0) { $s = $script:usbList[0]; $via = 'USB' }
+    elseif ($script:tcpList.Count -gt 0) { $s = $script:tcpList[0]; $via = 'Wi-Fi' }
+    elseif ($script:unauth.Count -gt 0) { return 'phone found, UNAUTHORIZED: accept the prompt on the phone' }
+    if (!$s) { return 'no phone found  (plug in USB, or p = pair)' }
+    if ($s -ne $script:tuiSeen) {
+        $script:serial = $s
+        $m = Get-PhoneValue @('getprop', 'ro.product.model')
+        $ui = Get-OneUi
+        if ($ui) { $m = "$m, One UI $ui" }
+        $script:tuiModel = $m
+        $script:tuiSeen = $s
+    }
+    $name = if ($script:tuiModel) { $script:tuiModel } else { $s }
+    return "$name via $via"
+}
+function Show-Menu {
+    if (!$script:scrcpyVer) {
+        $script:scrcpyVer = if ((Get-ScrcpyLine) -match '^scrcpy\s+(\S+)') { $Matches[1] } else { '?' }
+    }
+    $screen = Get-Cfg 'DEX_SCREEN'
+    if (!$screen) { $screen = 'on' }
+    $mode = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { 'fullscreen' } else { 'window' }
+    $res = Get-Cfg 'DEX_RES'
+    if (!$res) { $res = 'auto' }
+    $dpi = Get-Cfg 'DEX_DPI'
+    if (!$dpi) { $dpi = 'auto' }
+    $phone = Get-TuiPhone
+    Clear-Screen
+    Write-Host ''
+    Write-BoxLine $script:bx.TL $script:bx.TR
+    $right = "scrcpy $($script:scrcpyVer)"
+    Write-BoxRow ('Galaxy DeX'.PadRight([math]::Max(0, $script:boxW - 2 - $right.Length)) + $right)
+    Write-BoxLine $script:bx.ML $script:bx.MR
+    Write-BoxKv 'Phone' $phone
+    Write-BoxKv 'Screen' "phone $screen" "$mode, $res @ $dpi"
+    Write-BoxLine $script:bx.ML $script:bx.MR
+    Write-BoxItem '1' 'Code' 'crisp text: coding, T3, browser'
+    Write-BoxItem '2' 'School' 'more room: Word / Excel side by side'
+    Write-BoxItem '3' 'Movie' 'high bitrate, H.265, smooth audio'
+    Write-BoxItem '4' 'Mirror' 'plain phone screen, no DeX'
+    Write-BoxRow ''
+    Write-BoxItem 'p' 'Pair' 'Wi-Fi pairing with a code (no cable)'
+    Write-BoxItem 'c' 'Connect' 'reconnect over Wi-Fi'
+    Write-BoxItem 'w' 'Wi-Fi' 'USB plugged in -> switch to Wi-Fi'
+    Write-BoxItem 'k' 'Keyboard' 'phone keyboard layout (Turkish Q)'
+    Write-BoxItem 's' 'Screen' 'phone panel while DeX runs: on / dim / off'
+    Write-BoxItem 'f' 'Window' 'toggle window / fullscreen start'
+    Write-BoxItem 'r' 'Size' 'set window size and DPI'
+    Write-BoxItem 'd' 'Doctor' 'versions, devices, One UI check'
+    Write-BoxItem 'x' 'Wake' 'unfreeze a stuck DeX window'
+    Write-BoxItem 'u' 'Update' 're-run the installer'
+    Write-BoxItem 'q' 'Quit' ''
+    Write-BoxLine $script:bx.BL $script:bx.BR
+    if ($script:tuiMsg[0]) { Write-Host ('  ' + $script:tuiMsg[0]) -ForegroundColor $script:tuiMsg[1]; $script:tuiMsg = @('', 'Gray') }
+    Write-Host ('  Choose (Enter = 1) ' + $script:bx.Arrow + ' ') -NoNewline
+}
+# Runs a command, then waits for a key so its output can be read.
+function Invoke-MenuAction([scriptblock]$Action) {
+    Clear-Screen
+    $rc = 0
+    try { $rc = Get-ExitCode (& $Action) } catch { Write-Err $_.Exception.Message; $rc = 1 }
+    if ($rc -ne 0) { $script:tuiMsg = @("Last command exited with code $rc.", 'DarkGray') }
+    Write-Host ''
+    Write-Host '  Press any key to return to the menu...' -NoNewline -ForegroundColor DarkGray
+    [void][Console]::ReadKey($true)
+}
+function Invoke-Menu {
+    Test-ToolInstallation
+    while ($true) {
+        Show-Menu
+        $key = [Console]::ReadKey($true)
+        Write-Host ''
+        $choice = ([string]$key.KeyChar).ToLowerInvariant()
+        if ($key.Key -eq 'Enter') { $choice = '1' } elseif ($key.Key -eq 'Escape') { $choice = 'q' }
+        switch ($choice) {
+            '1' { Invoke-MenuAction { Invoke-DexStart 'code' } }
+            '2' { Invoke-MenuAction { Invoke-DexStart 'school' } }
+            '3' { Invoke-MenuAction { Invoke-DexStart 'movie' } }
+            '4' { Invoke-MenuAction { Invoke-DexStart 'mirror' } }
+            'p' { Invoke-MenuAction { Invoke-Pair } }
+            'c' { Invoke-MenuAction { Invoke-ConnectCmd '' } }
+            'w' { Invoke-MenuAction { Invoke-Wifi } }
+            'k' { Invoke-MenuAction { Invoke-Keyboard } }
+            'd' { Invoke-MenuAction { Invoke-Doctor } }
+            'x' { Invoke-MenuAction { Invoke-Wake } }
+            'h' { Invoke-MenuAction { Show-Help } }
+            '?' { Invoke-MenuAction { Show-Help } }
+            'u' { return (Get-ExitCode (Invoke-Update)) }
+            'q' { Write-Host ''; return 0 }
+            's' {
+                $current = Get-Cfg 'DEX_SCREEN'
+                if ($current -eq 'dim') {
+                    Save-ConfigValue 'DEX_SCREEN' 'off'
+                    $script:tuiMsg = @('Phone screen OFF while DeX runs. If DeX freezes on your phone, press x (wake) and switch back to on/dim.', 'Yellow')
+                } elseif ($current -eq 'off') {
+                    Save-ConfigValue 'DEX_SCREEN' 'on'
+                    $script:tuiMsg = @('Phone screen stays ON while DeX runs (safest).', 'Gray')
+                } else {
+                    Save-ConfigValue 'DEX_SCREEN' 'dim'
+                    $script:tuiMsg = @('Phone screen DIMMED while DeX runs (brightness restored on exit).', 'Gray')
+                }
+            }
+            'f' {
+                if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') {
+                    Save-ConfigValue 'DEX_FULLSCREEN' '0'
+                    $script:tuiMsg = @('DeX starts in a resizable window (F11 toggles fullscreen).', 'Gray')
+                } else {
+                    Save-ConfigValue 'DEX_FULLSCREEN' '1'
+                    $script:tuiMsg = @("DeX starts fullscreen at your monitor's resolution, like a real DeX monitor.", 'Gray')
+                }
+            }
+            'r' {
+                $newRes = Read-Host '  Window size WxH (empty = auto, 80% of screen)'
+                $newDpi = Read-Host '  DPI (empty = profile default; 160 normal, 140 denser, 200 bigger)'
+                if ($newRes -notmatch '^(\d+x\d+)?$') { $script:tuiMsg = @('Size must look like 1600x900.', 'Red') }
+                elseif ($newDpi -notmatch '^\d*$') { $script:tuiMsg = @('DPI must be a number.', 'Red') }
+                else {
+                    Save-ConfigValue 'DEX_RES' $newRes
+                    Save-ConfigValue 'DEX_DPI' $newDpi
+                    $script:tuiMsg = @('Saved.', 'Gray')
+                }
+            }
+            default { $script:tuiMsg = @("Unknown key '$choice'. Press 1-4 to start DeX, q to quit.", 'DarkGray') }
+        }
+    }
+}
+# --- main -------------------------------------------------------------------------
+try {
+    $command = ''
+    $position = 0
+    if ($args.Count -gt 0 -and !([string]$args[0]).StartsWith('-')) { $command = [string]$args[0]; $position = 1 }
+    $positional = @()
+    while ($position -lt $args.Count) {
+        $arg = [string]$args[$position]; $position++
+        if ($arg -like '--res=*') { $script:opt.Res = $arg.Substring(6); continue }
+        if ($arg -like '--dpi=*') { $script:opt.Dpi = $arg.Substring(6); continue }
+        if ($arg -like '--screen=*') { $script:opt.Screen = $arg.Substring(9); continue }
+        switch ($arg) {
+            '--' { $script:opt.Raw = @($args | Select-Object -Skip $position); $position = $args.Count }
+            '--res' { if ($position -ge $args.Count) { throw '--res needs WxH.' }; $script:opt.Res = [string]$args[$position]; $position++ }
+            '--dpi' { if ($position -ge $args.Count) { throw '--dpi needs a number.' }; $script:opt.Dpi = [string]$args[$position]; $position++ }
+            '--screen' { if ($position -ge $args.Count) { throw '--screen needs on, dim or off.' }; $script:opt.Screen = [string]$args[$position]; $position++ }
+            '--usb' { $script:opt.Mode = 'usb' }
+            '--wifi' { $script:opt.Mode = 'wifi' }
+            '--screen-off' { $script:opt.Screen = 'off' }
+            '--fullscreen' { $script:opt.Fullscreen = '1' }
+            '--no-freeform' { $script:opt.Freeform = '0' }
+            { $_ -in @('--menu', '--tui') } { $command = 'menu' }
+            { $_ -in @('-h', '--help') } { $command = 'help' }
+            default {
+                if ($arg.StartsWith('-')) { throw "Unknown option: $arg (see: dex help)" }
+                $positional += $arg
+            }
+        }
+    }
+    if ($script:opt.Res -and $script:opt.Res -notmatch '^[1-9]\d*x[1-9]\d*$') { throw '--res must look like 1600x900.' }
+    if ($script:opt.Dpi -and $script:opt.Dpi -notmatch '^[1-9]\d*$') { throw '--dpi must be a positive number.' }
+    if ($script:opt.Screen -notin @('', 'on', 'dim', 'off')) { throw '--screen must be on, dim or off.' }
+    if (!$command) { $command = if (Test-Interactive) { 'menu' } else { 'code' } }
+    $rc = 0
+    switch ($command) {
+        'menu' { $rc = Invoke-Menu }
+        { $_ -in @('code', 'school', 'movie', 'mirror') } { $rc = Invoke-DexStart $command }
+        'pair' { $rc = Invoke-Pair }
+        'connect' { $rc = Invoke-ConnectCmd $(if ($positional.Count -gt 0) { $positional[0] } else { '' }) }
+        'wifi' { $rc = Invoke-Wifi }
+        'wake' { $rc = Invoke-Wake }
+        'keyboard' { $rc = Invoke-Keyboard }
+        'doctor' { $rc = Invoke-Doctor }
+        'update' { $rc = Invoke-Update }
+        'uninstall' { $rc = Invoke-Uninstall }
+        'help' { Show-Help }
+        default { throw "Unknown command: $command. Run: dex help" }
+    }
+    exit (Get-ExitCode $rc)
 } catch { Write-Host "DeX: $($_.Exception.Message)"; exit 1 }

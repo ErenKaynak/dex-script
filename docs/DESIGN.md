@@ -52,6 +52,9 @@ fast `Invoke-WebRequest`.
 
 ## CLI: `dex [command] [options]`
 
+`dex` with no command on an interactive terminal opens the menu (TUI, below). Non-interactive
+(no TTY, or env `DEX_NO_TUI=1`) it behaves like `dex code`, so scripts and CI keep working.
+
 Commands
 
 | command | does |
@@ -63,6 +66,7 @@ Commands
 | `dex pair` | wireless pairing without a cable (Android "Pair device with pairing code") |
 | `dex connect [ip:port]` | connect over Wi-Fi (no arg → discover via mDNS, else last saved endpoint, else prompt) |
 | `dex wifi` | USB plugged → `adb tcpip 5555`, read phone Wi-Fi IP (`adb shell ip -f inet addr show wlan0`), connect, save endpoint; tell user to unplug (survives until phone reboot) |
+| `dex wake` | `adb shell input -d 0 keyevent KEYCODE_WAKEUP` (+ plain `KEYCODE_WAKEUP`); recovers a frozen DeX window after the phone dozed |
 | `dex keyboard` | open phone's Physical keyboard settings (`adb shell am start -a android.settings.HARD_KEYBOARD_SETTINGS`) and tell user to pick **Turkish Q** |
 | `dex doctor` | versions (scrcpy/adb), `adb devices -l`, phone model, Android SDK (`getprop ro.build.version.sdk`), One UI (`getprop ro.build.version.oneui`, e.g. 90000 → 9.0), warn if One UI < 8 (DeX on virtual display needs 8+) |
 | `dex update` | re-run the installer from the raw URL (same one-liner) |
@@ -70,8 +74,45 @@ Commands
 | `dex help` / `-h` | usage |
 
 Options (any start command): `--res WxH` (initial size; default = 80% of primary screen if
-detectable, else 1600x900), `--dpi N`, `--usb`, `--wifi`, `--screen-off` (turn phone panel off while
-running), `--fullscreen`, `--` then extra raw scrcpy args.
+detectable, else 1600x900; with `--fullscreen` 100% / 1920x1080), `--dpi N`, `--usb`, `--wifi`,
+`--screen on|dim|off` (`--screen-off` = off), `--fullscreen`, `--no-freeform`, `--` then extra raw
+scrcpy args.
+
+### Interactive menu (TUI)
+
+Boxed menu (UTF-8 box drawing when the locale / console is UTF-8, ASCII otherwise), single-key
+selection, loops until `q`:
+
+- header: `Galaxy DeX` + scrcpy version; status line with phone model, One UI version and
+  transport (`via USB` / `via Wi-Fi`), or "no phone found", "UNAUTHORIZED", udev hint; settings
+  line (`phone on|dim|off`, `window|fullscreen`, `res @ dpi`).
+- `Enter`/`1` Code, `2` School, `3` Movie, `4` Mirror, `p` Pair, `c` Connect, `w` Wi-Fi, `k`
+  Keyboard, `s` cycle `DEX_SCREEN` on → dim → off, `f` toggle `DEX_FULLSCREEN`, `r` prompt
+  `DEX_RES` / `DEX_DPI`, `d` Doctor, `x` Wake, `u` Update, `h` help, `q`/Esc quit.
+- After an action: "Press any key to return to the menu". Errors (no device etc.) are shown in
+  the menu instead of exiting.
+
+### Start sequence (DeX profiles)
+
+1. Select device, resolve options.
+2. **Wake**: `dumpsys power` → if `mWakefulness=Asleep|Dozing` inject `KEYCODE_WAKEUP` and wait 1 s
+   (scrcpy 5.0.1 never powers on the device for a new virtual display; a dozing Galaxy renders
+   nothing). `dumpsys window policy` → KeyguardServiceDelegate `showing=true` → warn "unlock".
+3. **Freeform prerequisite** (unless `--no-freeform` / `DEX_FREEFORM=0` / mirror): if
+   `settings get global enable_freeform_support` ≠ 1, set it to 1; restore the original value
+   (`null` → `settings delete`) after scrcpy exits.
+4. **Screen mode**: `dim` → save `screen_brightness` + `screen_brightness_mode`, set mode 0 and
+   brightness 0, restore after exit (also on Ctrl+C). `off` → scrcpy `--turn-screen-off`.
+5. Run scrcpy with stdout+stderr streamed to the console and watched line by line. On
+   `New display: WxH/DPI (id=N)` run `adb shell wm set-display-windowing-mode -d N 5`
+   (5 = WINDOWING_MODE_FREEFORM). One UI 8.5/9 (Android 16 QPR2+) no longer activates desktop
+   windowing on app-created virtual displays (scrcpy issue #6143): DeX starts but every app is
+   fullscreen and immovable. The per-display persisted windowing mode is checked before all
+   desktop-mode heuristics in `DisplayWindowSettings.getWindowingModeLocked()`, so forcing it
+   gives movable, resizable windows. On One UI 8.0 the command does not exist (ignored; freeform
+   already works). scrcpy 5.x keeps the same virtual display across resizes and capture resets,
+   so the id is stable; the watcher re-applies anyway if the line repeats.
+6. Return scrcpy's exit code (0 closed, 2 device disconnected); restore phone settings.
 
 ### Device selection (start commands)
 
@@ -100,9 +141,19 @@ Common to all DeX profiles (never restrict resizing or multitasking):
 ```
 --new-display=<W>x<H>/<DPI>  --flex-display  --no-vd-destroy-content
 --keyboard=uhid  --mouse=sdk  --mouse-bind=++++:bhsn
---window-title="Galaxy DeX (<profile>)"  --shortcut-mod=<mod>  --stay-awake (USB only)
---video-codec=h264  --disable-screensaver
+--window-title="Galaxy DeX (<profile>)"  --shortcut-mod=<mod>
+--keep-active  --disable-screensaver  --max-fps=60  --video-bit-rate=<N>M
+--stay-awake (USB only)  --video-buffer=50 (Wi-Fi only)  --video-codec=<codec>
+--turn-screen-off (--screen off only)  --fullscreen (--fullscreen only)
 ```
+
+- `--keep-active`: simulated user activity; keeps the phone from sleeping on USB *and* Wi-Fi
+  without changing settings. A sleeping phone stops rendering the virtual display ("DeX frozen").
+  `--stay-awake` (`stay_on_while_plugged_in`) only works when plugged in, so it is USB-only.
+- `--video-buffer=50` over Wi-Fi absorbs jitter, the main cause of stutter/"unresponsive" sessions.
+- `--turn-screen-off` is opt-in (`--screen off`): on some Galaxy phones the panel-off puts the
+  phone into doze and the DeX display freezes; `dex wake` recovers. Default `on`, `dim` is the safe
+  "dark phone" alternative (brightness 0, restored afterwards).
 
 - `--no-vd-destroy-content`: closing the window moves apps to the phone instead of killing them.
 - `--mouse-bind=++++:bhsn`: right/middle click reach DeX (context menus in Office) instead of BACK/HOME.
@@ -126,7 +177,8 @@ files, Plex/Jellyfin work fine here."
 Over Wi-Fi lower defaults: bit-rate × 0.5 (code 8M, school 6M, movie 12M), keep 60 fps.
 
 Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_SHORTCUT_MOD`, `DEX_DPI`,
-`DEX_RES`, `DEX_EXTRA_ARGS`. Write config safely (replace key line or append).
+`DEX_RES`, `DEX_EXTRA_ARGS`, `DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM`
+(0|1), `DEX_KEYBOARD_HINT_SHOWN`. Write config safely (replace key line or append).
 
 Screen size detection: Linux `xrandr --current` (primary or first connected) or
 `xdpyinfo`; Wayland fallback 1600x900. macOS: `system_profiler SPDisplaysDataType` ("Resolution:"
@@ -136,7 +188,11 @@ Default window res = 80% of that, rounded down to multiples of 8.
 ### Other behaviour
 
 - Use the bundled `adb`/`scrcpy` by absolute path (don't depend on PATH). Export `ADB` env var to
-  scrcpy so it uses the bundled adb.
+  scrcpy so it uses the bundled adb. Test overrides: `DEX_ADB`, `DEX_SCRCPY`, `DEX_CONFIG_DIR`,
+  `DEX_DRY_RUN=1` (print the scrcpy command, exit 0), `DEX_NO_TUI=1`.
+- `tests/fake-phone.sh`: stub adb/scrcpy pair (Galaxy on One UI 9, dozing) that checks the whole
+  start flow without hardware (wake, freeform fix on "New display", dim/restore, argument list,
+  exit 2 without device). Runs in CI.
 - First run: if config has no `DEX_KEYBOARD_HINT_SHOWN`, print Turkish Q hint once and set it.
 - Exit codes: 0 ok, 1 usage/runtime error, 2 no device.
 - Bash: `set -euo pipefail`, POSIX-ish bash 3.2 compatible (macOS ships bash 3.2: no associative
@@ -150,4 +206,4 @@ Default window res = 80% of that, rounded down to multiples of 8.
 2. Settings → Developer options → **USB debugging** ON (cable) and/or **Wireless debugging** ON (Wi-Fi).
 3. Connect: plug USB and accept "Allow USB debugging", or run `dex pair`.
 4. `dex keyboard` → set physical keyboard layout to **Turkish Q** (once).
-5. `dex` — DeX opens in a window. Resize freely; F11 = fullscreen.
+5. `dex` — menu: press 1. DeX opens in a window. Resize freely; F11 = fullscreen.

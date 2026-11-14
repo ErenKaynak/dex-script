@@ -79,7 +79,7 @@ main() {
     tar -xzf "$tmp/$asset" -C "$tmp/x"
     local top
     top="$(find "$tmp/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-    [ -n "$top" ] && [ -x "$top/scrcpy" ] || die "Unexpected archive layout."
+    if [ -z "$top" ] || [ ! -x "$top/scrcpy" ]; then die "Unexpected archive layout."; fi
     if [ -x "$root/scrcpy/adb" ]; then "$root/scrcpy/adb" kill-server >/dev/null 2>&1 || true; fi
     rm -rf "$root/scrcpy"
     mv "$top" "$root/scrcpy"
@@ -169,7 +169,7 @@ EOF
   say "  2. Settings > Developer options > USB debugging ON (cable) and/or Wireless debugging ON (Wi-Fi)."
   say "  3. Connect: plug in USB and accept \"Allow USB debugging\", or run: dex pair"
   say "  4. Run: dex keyboard   (set the physical keyboard layout to Turkish Q, once)"
-  say "  5. Run: dex            (DeX opens in a window; resize freely, F11 = fullscreen)"
+  say "  5. Run: dex            (menu: press 1 for DeX; resize the window freely, F11 = fullscreen)"
   say "${c_dim}Needs One UI 8+ on the phone. Check with: dex doctor${c_off}"
 }
 
