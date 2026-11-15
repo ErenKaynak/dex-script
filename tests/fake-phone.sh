@@ -49,6 +49,7 @@ EOF
 chmod +x "$tmp/bin/adb" "$tmp/bin/scrcpy"
 
 export FAKE_LOG="$log" DEX_ADB="$tmp/bin/adb" DEX_SCRCPY="$tmp/bin/scrcpy" DEX_CONFIG_DIR="$tmp/cfg" DEX_NO_TUI=1
+export DEX_SERVER_PATCHED="$tmp/no-patched-server" # tests must not depend on what this machine has installed
 
 fail() { echo "FAIL: $*"; echo "--- calls:"; cat "$log"; exit 1; }
 expect() { grep -qF -- "$1" "$log" || fail "expected call: $1"; }
