@@ -90,6 +90,29 @@ main() {
     ok "Installed scrcpy $ver to $root/scrcpy"
   fi
 
+  # --- patched scrcpy server (Android 17+: desktop-capable virtual display) -----
+  # Built by .github/workflows/server.yml from the official source plus server/*.patch and
+  # published as a release asset of this repo. Optional: dex falls back to the stock server
+  # (and to the overlay display on One UI 8.5+/9) when it is missing.
+  local srv_tag="${DEX_SERVER_TAG:-server-v$ver-dex1}"
+  local srv_base="https://github.com/$repo/releases/download/$srv_tag"
+  local srv_dst="$root/scrcpy/scrcpy-server-dex"
+  if [ -f "$srv_dst" ] && [ "$(cat "$root/scrcpy/SERVER_TAG" 2>/dev/null)" = "$srv_tag" ]; then
+    ok "Patched scrcpy server ($srv_tag) already installed"
+  elif fetch "$srv_base/scrcpy-server" "$tmp/scrcpy-server" 2>/dev/null && fetch "$srv_base/scrcpy-server.sha256" "$tmp/scrcpy-server.sha256" 2>/dev/null; then
+    want="$(awk '{print $1; exit}' "$tmp/scrcpy-server.sha256")"
+    got="$(sha256_of "$tmp/scrcpy-server")"
+    if [ -n "$want" ] && [ "$want" = "$got" ]; then
+      mv -f "$tmp/scrcpy-server" "$srv_dst"
+      printf '%s\n' "$srv_tag" > "$root/scrcpy/SERVER_TAG"
+      ok "Installed the patched scrcpy server ($srv_tag): real DeX windows on the resizable virtual display (Android 17+)"
+    else
+      warn "Patched scrcpy server: SHA256 mismatch, not installed (dex uses the stock server / overlay display)."
+    fi
+  else
+    warn "Patched scrcpy server ($srv_tag) not available yet; dex uses the stock server (overlay display on One UI 8.5+/9)."
+  fi
+
   # --- CLI --------------------------------------------------------------------
   if [ -n "${DEX_SOURCE_DIR:-}" ]; then
     cp "$DEX_SOURCE_DIR/bin/dex" "$tmp/dex" || die "Cannot read $DEX_SOURCE_DIR/bin/dex"

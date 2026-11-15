@@ -34,7 +34,7 @@ Hard constraints
 | | Linux / macOS | Windows |
 |---|---|---|
 | root | `~/.local/share/dex` | `%LOCALAPPDATA%\dex` |
-| scrcpy | `<root>/scrcpy/` (flattened, version in `<root>/scrcpy/VERSION`) | same |
+| scrcpy | `<root>/scrcpy/` (flattened, version in `<root>/scrcpy/VERSION`; patched server `<root>/scrcpy/scrcpy-server-dex`, tag in `SERVER_TAG`) | same |
 | CLI | `~/.local/bin/dex` (bash) | `<root>\bin\dex.ps1` + `<root>\bin\dex.cmd` shim |
 | config | `~/.config/dex/config` | `%APPDATA%\dex\config` |
 | PATH | append `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc`, `~/.zshrc`, `~/.profile` if missing (marker comment `# dex`) | add `<root>\bin` to **user** PATH (HKCU) and current session |
@@ -77,7 +77,8 @@ Commands
 Options (any start command): `--res WxH` (initial size; default = 80% of primary screen if
 detectable, else 1600x900; with `--fullscreen` 100% / 1920x1080), `--dpi N`, `--usb`, `--wifi`,
 `--screen on|dim|off` (`--screen-off` = off), `--fullscreen`, `--no-freeform`, `--mouse uhid|sdk`,
-`--display auto|overlay|virtual`, `--debug`, `--` then extra raw scrcpy args.
+`--display auto|overlay|virtual`, `--server auto|patched|stock`, `--debug`, `--` then extra raw
+scrcpy args.
 
 ### Interactive menu (TUI)
 
@@ -90,7 +91,7 @@ selection, loops until `q`:
 - `Enter`/`1` Code, `2` School, `3` Movie, `4` Mirror, `p` Pair, `c` Connect, `w` Wi-Fi, `k`
   Keyboard, `s` cycle `DEX_SCREEN` on → dim → off, `f` toggle `DEX_FULLSCREEN`, `r` prompt
   `DEX_RES` / `DEX_DPI`, `m` toggle `DEX_MOUSE` uhid ↔ sdk, `o` cycle `DEX_DISPLAY` auto → overlay
-  → virtual, `d` Doctor, `x` Wake, `l` Log (`dex debug`), `u` Update, `h` help, `q`/Esc quit.
+  → virtual, `v` cycle `DEX_SERVER` auto → patched → stock, `d` Doctor, `x` Wake, `l` Log (`dex debug`), `u` Update, `h` help, `q`/Esc quit.
 - Phone line when nothing is connected but a phone is remembered: `not connected: <name> (last at
   <ip>) · c = connect`.
 - After an action: "Press any key to return to the menu". Errors (no device etc.) are shown in
@@ -128,7 +129,19 @@ selection, loops until `q`:
    back to the virtual display with a warning. Known costs: Android's `OverlayDisplayWindow`
    preview on the phone (not hideable), fixed size per session. Open risk: localdex reports a
    SystemUI NPE on caption drags of overlay displays on One UI 9 with injected input; untested
-   with the UHID mouse. The permanent fix is the patched scrcpy server (see `server/`).
+   with the UHID mouse.
+3c. **Server** (`DEX_SERVER` / `--server`, default `auto` = patched when
+   `<root>/scrcpy/scrcpy-server-dex` exists and SDK ≥ 37, else stock). The patched server is the
+   official 5.0.1 source plus `server/0001-allows-content-mode-switch.patch` (scrcpy PR #7055:
+   on SDK ≥ 37 decorated virtual displays get `VIRTUAL_DISPLAY_FLAG_ALLOWS_CONTENT_MODE_SWITCH`
+   (1<<17) instead of `SHOULD_SHOW_SYSTEM_DECORATIONS`, and no `OWN_CONTENT_ONLY`), built by
+   `.github/workflows/server.yml` (`build_without_gradle.sh`, version string stays 5.0.1 so the
+   stock client accepts it) and published as release `server-v<scrcpy version>-dexN` with
+   `scrcpy-server` + `scrcpy-server.sha256`. The installer downloads and verifies it (optional:
+   a missing release only warns), `dex` passes it with `SCRCPY_SERVER_PATH`. With the patched
+   server, `auto` display = virtual (desktop-eligible, keeps `--flex-display`, no phone preview);
+   an explicit `--display overlay` still wins. Env `DEX_SERVER_PATCHED` overrides the path (tests),
+   `DEX_SERVER_TAG` the release tag (installer).
    Opt-in config `DEX_FORCE_DESKTOP=1`: additionally set global
    `force_desktop_mode_on_external_displays` to 1 for the session (restored after, `null` →
    delete). AOSP then treats the virtual display like an external monitor (full desktop mode);
@@ -240,7 +253,8 @@ Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_LAST_IP`,
 `DEX_PHONE_SERIAL`, `DEX_PHONE_NAME`, `DEX_SHORTCUT_MOD`, `DEX_DPI`, `DEX_RES`, `DEX_EXTRA_ARGS`,
 `DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM` (0|1), `DEX_FREEFORM_SUPPORT`
 (0|1, unset = by One UI version), `DEX_DISPLAY` (overlay|virtual, unset = by One UI/Android
-version), `DEX_MOUSE` (uhid|sdk, unset = by Android version),
+version), `DEX_SERVER` (patched|stock, unset = patched when installed on SDK ≥ 37), `DEX_MOUSE`
+(uhid|sdk, unset = by Android version),
 `DEX_FORCE_DESKTOP` (0|1), `DEX_LAST_PROFILE`, `DEX_KEYBOARD_HINT_SHOWN`. Write config safely
 (replace key line or append).
 

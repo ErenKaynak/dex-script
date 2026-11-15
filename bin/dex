@@ -7,6 +7,7 @@ DEX_REPO="${DEX_REPO:-ErenKaynak/dex-script}"
 ROOT="${DEX_HOME:-$HOME/.local/share/dex}"
 SCRCPY="${DEX_SCRCPY:-$ROOT/scrcpy/scrcpy}"
 ADB="${DEX_ADB:-$ROOT/scrcpy/adb}"
+SERVER_PATCHED="${DEX_SERVER_PATCHED:-$ROOT/scrcpy/scrcpy-server-dex}" # built by .github/workflows/server.yml
 CONFIG_DIR="${DEX_CONFIG_DIR:-$HOME/.config/dex}"
 CONFIG="$CONFIG_DIR/config"
 OS="$(uname -s)"
@@ -55,11 +56,17 @@ Options (start commands):
   --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
   --no-freeform      skip the One UI 8.5+/9 windowing fix
   --display auto|overlay|virtual
-                     overlay (default on One UI 8.5+/9): DeX runs on a system overlay
-                     display, the only kind Android 16 QPR2+/17 gives real desktop windows
-                     (title bars, drag, resize, minimize). Android shows a small preview of
-                     it on the phone screen. virtual: scrcpy's own display (resizes with the
-                     window, but on One UI 8.5+/9 apps have no title bars).
+                     overlay (default on One UI 8.5+/9 with the stock server): DeX runs on a
+                     system overlay display, the only kind Android 16 QPR2+/17 gives real
+                     desktop windows (title bars, drag, resize, minimize) with the stock
+                     scrcpy server. Android shows a small preview of it on the phone screen.
+                     virtual: scrcpy's own display (resizes with the window; on One UI
+                     8.5+/9 it only gets title bars with the patched server).
+  --server auto|patched|stock
+                     patched (default when installed and Android 17+): dex's build of the
+                     scrcpy server that creates the virtual display as desktop-capable
+                     (scrcpy PR #7055), so --display virtual gets real windows and still
+                     resizes with the window. stock: the server from the scrcpy release.
   --mouse uhid|sdk   uhid (default on Android 15+): real HID mouse on the DeX display,
                      DeX title bars drag like with a plugged-in mouse (Alt releases the
                      PC pointer). sdk: injected touch-style clicks, pointer not captured.
@@ -73,7 +80,7 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 Config: $CONFIG
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
   DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
-  DEX_DISPLAY (auto|overlay|virtual), DEX_MOUSE (uhid|sdk),
+  DEX_DISPLAY (auto|overlay|virtual), DEX_SERVER (auto|patched|stock), DEX_MOUSE (uhid|sdk),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 EOF
@@ -349,10 +356,28 @@ overlay_destroy() {
   phone_shell settings delete global overlay_display_devices >/dev/null
   OVERLAY_ID=""
 }
-want_display() { # prints overlay|virtual: --display, config DEX_DISPLAY, else by One UI / Android version
+# Patched scrcpy server (server/0001-allows-content-mode-switch.patch, built by CI): on Android 17+
+# it creates the virtual display with ALLOWS_CONTENT_MODE_SWITCH instead of "always show system
+# decorations", which makes it desktop-eligible, so the virtual display gets real windows AND keeps
+# --flex-display resizing, with no preview on the phone. scrcpy picks it up via SCRCPY_SERVER_PATH.
+SERVER_MODE=stock
+want_server() { # prints patched|stock: --server, config DEX_SERVER, else patched when installed and SDK >= 37
+  local v sdk
+  v="${OPT_SERVER:-$(cfg_get DEX_SERVER)}"
+  case "$v" in
+    stock) echo stock; return ;;
+    patched) if [ -f "$SERVER_PATCHED" ]; then echo patched; else warn "Patched server not installed ($SERVER_PATCHED): run dex update. Using the stock server." >&2; echo stock; fi; return ;;
+  esac
+  [ -f "$SERVER_PATCHED" ] || { echo stock; return; }
+  sdk="$(phone_shell getprop ro.build.version.sdk)"
+  case "$sdk" in [0-9]*) [ "$sdk" -ge 37 ] && { echo patched; return; } ;; esac
+  echo stock
+}
+want_display() { # prints overlay|virtual: --display, config DEX_DISPLAY, else by server / One UI / Android version
   local v ui sdk
   v="${OPT_DISPLAY:-$(cfg_get DEX_DISPLAY)}"
   case "$v" in overlay|virtual) echo "$v"; return ;; esac
+  [ "$SERVER_MODE" != patched ] || { echo virtual; return; } # the patched server makes the virtual display desktop-capable
   ui="$(phone_shell getprop ro.build.version.oneui)"
   case "$ui" in
     [0-9]*) if [ "$ui" -ge 80500 ]; then echo overlay; else echo virtual; fi; return ;;
@@ -546,8 +571,12 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   [ "$profile" != "mirror" ] || FREEFORM=0 # no virtual display to fix
 
   mouse="$(want_mouse)"
+  SERVER_MODE=stock
   display=virtual
-  [ "$profile" = "mirror" ] || display="$(want_display)"
+  if [ "$profile" != "mirror" ]; then
+    SERVER_MODE="$(want_server)"
+    display="$(want_display)"
+  fi
 
   local args=(-s "$SERIAL")
   if [ "$profile" != "mirror" ]; then
@@ -582,7 +611,9 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   if [ "${#OPT_RAW[@]}" -gt 0 ]; then args+=("${OPT_RAW[@]}"); fi
 
   export ADB
+  if [ "$SERVER_MODE" = patched ]; then export SCRCPY_SERVER_PATH="$SERVER_PATCHED"; else unset SCRCPY_SERVER_PATH; fi
   if [ "${DEX_DRY_RUN:-0}" = "1" ]; then
+    [ "$SERVER_MODE" != patched ] || printf 'SCRCPY_SERVER_PATH=%q ' "$SERVER_PATCHED"
     printf 'scrcpy'; printf ' %q' "${args[@]}"; printf '\n'
     return 0
   fi
@@ -611,7 +642,7 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
     fi
   fi
   if [ "${OPT_DEBUG:-0}" = 1 ]; then debug_start "${args[@]}"; fi
-  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display)..."
+  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display, server: $SERVER_MODE)..."
   local modn; modn="$(mod_name "$mod")"
   say "${C_DIM}Resize the window freely. F11 = fullscreen, $modn+q quits. Frozen? Run: dex wake${C_OFF}"
   if [ "$profile" != "mirror" ] && [ "$mouse" = uhid ]; then
@@ -797,6 +828,8 @@ cmd_doctor() {
   ffs="$(phone_shell settings get global enable_freeform_support)"
   local wff; wff="$(want_freeform_support)"
   say "freeform support: $ffs (dex sets it to ${wff:-<unchanged>} while DeX runs)"
+  SERVER_MODE="$(want_server)"
+  say "server:           $SERVER_MODE (patched = dex build with desktop-capable virtual display; file: $SERVER_PATCHED$([ -f "$SERVER_PATCHED" ] || printf ' MISSING'))"
   say "display mode:     $(want_display) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
   say "force desktop:    $(phone_shell settings get global force_desktop_mode_on_external_displays) (DEX_FORCE_DESKTOP=$(cfg_get DEX_FORCE_DESKTOP))"
   say "mouse mode:       $(want_mouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
@@ -905,6 +938,7 @@ tui_frame() { # prints one full frame
   screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
   mouse="$(cfg_get DEX_MOUSE)"; [ -n "$mouse" ] || mouse="auto"
   local dmode; dmode="$(cfg_get DEX_DISPLAY)"; [ -n "$dmode" ] || dmode="auto"
+  local smode; smode="$(cfg_get DEX_SERVER)"; [ -n "$smode" ] || smode="auto"
   if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then fullscreen="fullscreen"; else fullscreen="window"; fi
   res="$(cfg_get DEX_RES)"; [ -n "$res" ] || res="$(default_res 80) auto"
   dpi="$(cfg_get DEX_DPI)"; [ -n "$dpi" ] || dpi="auto"
@@ -920,7 +954,7 @@ tui_frame() { # prints one full frame
   printf '  %s%s%s %s%s%s%s%s%s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_B" "$(pad "Galaxy DeX on your PC" $((BOX_W-2-${#ver}-7)))" "$C_OFF" "$C_DIM" "scrcpy $ver" "$C_OFF" "$C_CYAN" "$V" "$C_OFF"
   hline "$ML" "$MR"
   row_kv "Phone" "$TUI_PHONE" "$TUI_PHONE_C" "$TUI_BATT"
-  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT $dmode $DOT mouse $mouse $DOT $res @ $dpi"
+  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT $dmode $DOT server $smode $DOT mouse $mouse $DOT $res @ $dpi"
   hline "$ML" "$MR"
   local m1="" m2="" m3="" m4=""
   case "$last" in code) m1="last " ;; school) m2="last " ;; movie) m3="last " ;; mirror) m4="last " ;; esac
@@ -938,6 +972,7 @@ tui_frame() { # prints one full frame
   row_item r "Size" "set window size and DPI"
   row_item m "Mouse" "real HID mouse (uhid) / injected touch (sdk)"
   row_item o "Display" "auto / overlay (One UI 9 windows) / virtual"
+  row_item v "Server" "auto / patched (dex build) / stock scrcpy"
   row_item d "Doctor" "versions, devices, One UI check"
   row_item x "Wake" "unfreeze a stuck DeX window"
   row_item l "Log" "start Code with a phone log for bug reports"
@@ -999,6 +1034,12 @@ tui_menu() {
           virtual) cfg_set DEX_DISPLAY ""; tui_msg "Display: auto (overlay on One UI 8.5+/9, virtual otherwise)." "$C_OK" ;;
           *) cfg_set DEX_DISPLAY overlay; tui_msg "Display: overlay (real desktop windows; fixed size; preview on the phone screen)." "$C_OK" ;;
         esac ;;
+      v|V)
+        case "$(cfg_get DEX_SERVER)" in
+          patched) cfg_set DEX_SERVER stock; tui_msg "Server: stock scrcpy server (virtual display has no title bars on One UI 8.5+/9; overlay mode works)." "$C_WARN" ;;
+          stock) cfg_set DEX_SERVER ""; tui_msg "Server: auto (patched when installed and Android 17+)." "$C_OK" ;;
+          *) if [ -f "$SERVER_PATCHED" ]; then cfg_set DEX_SERVER patched; tui_msg "Server: patched (desktop-capable virtual display: real windows, resizes with the window, no phone preview)." "$C_OK"; else tui_msg "Patched server not installed yet: press u (update) first." "$C_ERR"; fi ;;
+        esac ;;
       m|M)
         case "$(cfg_get DEX_MOUSE)" in
           sdk) cfg_set DEX_MOUSE uhid; tui_msg "Mouse: real HID mouse on the DeX display (title bars drag like native DeX; Alt releases the pointer)." "$C_OK" ;;
@@ -1029,7 +1070,7 @@ tui_menu() {
 }
 
 # --- main -------------------------------------------------------------------------------
-MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_MOUSE=""; OPT_DISPLAY=""; OPT_DEBUG=0; OPT_RAW=()
+MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_MOUSE=""; OPT_DISPLAY=""; OPT_SERVER=""; OPT_DEBUG=0; OPT_RAW=()
 CMD=""
 if [ $# -gt 0 ]; then
   case "$1" in -*) ;; *) CMD="$1"; shift ;; esac
@@ -1052,6 +1093,8 @@ while [ $# -gt 0 ]; do
     --mouse=*) OPT_MOUSE="${1#*=}"; shift ;;
     --display) [ $# -ge 2 ] || die "--display needs auto, overlay or virtual"; OPT_DISPLAY="$2"; shift 2 ;;
     --display=*) OPT_DISPLAY="${1#*=}"; shift ;;
+    --server) [ $# -ge 2 ] || die "--server needs auto, patched or stock"; OPT_SERVER="$2"; shift 2 ;;
+    --server=*) OPT_SERVER="${1#*=}"; shift ;;
     --debug) OPT_DEBUG=1; shift ;;
     --menu|--tui) CMD=menu; shift ;;
     -h|--help) CMD=help; shift ;;
@@ -1066,6 +1109,8 @@ case "$OPT_SCREEN" in ""|on|dim|off) ;; *) die "--screen must be on, dim or off"
 case "$OPT_MOUSE" in ""|uhid|sdk) ;; *) die "--mouse must be uhid or sdk" ;; esac
 case "$OPT_DISPLAY" in ""|auto|overlay|virtual) ;; *) die "--display must be auto, overlay or virtual" ;; esac
 [ "$OPT_DISPLAY" != auto ] || OPT_DISPLAY=""
+case "$OPT_SERVER" in ""|auto|patched|stock) ;; *) die "--server must be auto, patched or stock" ;; esac
+[ "$OPT_SERVER" != auto ] || OPT_SERVER=""
 
 if [ -z "$CMD" ]; then
   # No command: interactive menu on a terminal, otherwise the default profile (scripts, CI).
