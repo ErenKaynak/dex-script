@@ -108,7 +108,7 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: {CONFIG}
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
-  DEX_FREEFORM, DEX_LAST_ENDPOINT
+  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_LAST_ENDPOINT
 '@
     $text = $text.Replace('{CONFIG}', $script:configFile)
     Write-Host $text
@@ -253,11 +253,27 @@ function Invoke-DimOn {
     Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', '0') | Out-Null
     Write-Host 'Phone screen dimmed (restored when DeX closes).' -ForegroundColor DarkGray
 }
-function Invoke-FreeformSupportOn {
+# The "Enable freeform windows" developer option (global enable_freeform_support), set for the
+# session and restored on exit. One UI 8.0 builds may need it on. On One UI 8.5+/9 it is kept
+# off: with it on, the DeX title bar's drag and close/minimize/maximize buttons did nothing in a
+# field test, while sam1am/localdex gets draggable windows on One UI 9 with the option untouched.
+function Get-WantedFreeformSupport {
+    $v = Get-Cfg 'DEX_FREEFORM_SUPPORT'
+    if ($v -in @('0', '1')) { return $v }
+    $v = Get-PhoneValue @('getprop', 'ro.build.version.oneui')
+    if ($v -match '^\d+$' -and [int]$v -ge 80500) { return '0' }
+    return '1'
+}
+function Invoke-FreeformSupport([string]$Value) {
+    $script:savedFf = ''
     $v = Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')
-    if ($v -eq '1') { $script:savedFf = ''; return }
-    if ($v -match '^(null|\d+)$') { $script:savedFf = $v } else { $script:savedFf = '' }
-    Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', '1') | Out-Null
+    if ($v -notmatch '^(null|\d+)$' -or $v -eq $Value) { return } # unreadable, or already right
+    if ($v -eq 'null' -and $Value -eq '0') { return } # unset means off
+    $script:savedFf = $v
+    Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', $Value) | Out-Null
+    if ($Value -eq '0') {
+        Write-Host 'Freeform developer option off while DeX runs (it breaks window dragging on One UI 8.5+).' -ForegroundColor DarkGray
+    }
 }
 function Invoke-PhoneRestore {
     if ($script:savedBri -match '^\d+$') { Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', $script:savedBri) | Out-Null }
@@ -374,7 +390,7 @@ function Invoke-DexStart([string]$Kind) {
     Save-ConfigValue 'DEX_LAST_PROFILE' $Kind
     Invoke-WakePhone
     try {
-        if ($watch) { Invoke-FreeformSupportOn }
+        if ($watch) { Invoke-FreeformSupport (Get-WantedFreeformSupport) }
         if ($screen -eq 'dim') { Invoke-DimOn }
         Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen)..."
         Write-Host 'Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake' -ForegroundColor DarkGray
@@ -482,7 +498,8 @@ function Invoke-Doctor {
     }
     $wk = Get-Wakefulness
     if ($wk) { Write-Host "power:   $wk" }
-    Write-Host ('freeform support: ' + (Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')))
+    $ffs = Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')
+    Write-Host "freeform support: $ffs (dex sets it to $(Get-WantedFreeformSupport) while DeX runs)"
     return 0
 }
 function Invoke-Update {

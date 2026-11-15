@@ -187,4 +187,7 @@ Wi-Fi via mDNS / last known address), wakes the phone, and starts scrcpy with
 `--new-display=WxH/DPI --flex-display --no-vd-destroy-content --keyboard=uhid --keep-active` plus
 the profile settings. While scrcpy runs, `dex` watches its log for the new display id and runs
 `wm set-display-windowing-mode -d <id> 5` (freeform) on the phone, which is what One UI 8.5/9
-needs for movable, resizable DeX windows. See [docs/DESIGN.md](docs/DESIGN.md).
+needs for movable, resizable DeX windows. On One UI 8.5+ it also keeps the "freeform windows"
+developer option off while DeX runs (with it on, window title bars can't be dragged and their
+buttons don't work); set `DEX_FREEFORM_SUPPORT=1` in the config to force it on. See
+[docs/DESIGN.md](docs/DESIGN.md).

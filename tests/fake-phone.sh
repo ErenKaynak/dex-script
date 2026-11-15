@@ -12,18 +12,19 @@ log="$tmp/calls.log"
 
 cat > "$tmp/bin/adb" <<'EOF'
 #!/usr/bin/env bash
-# Records every call; answers like a connected Galaxy S25 (One UI 9, asleep, freeform unset).
+# Records every call; answers like a connected Galaxy S25 (One UI 9, asleep, freeform option on).
+# FAKE_ONEUI / FAKE_FF override the One UI version and the freeform option value.
 printf 'adb %s\n' "$*" >> "$FAKE_LOG"
 case "$*" in
   "devices -l") printf 'List of devices attached\nR5CX1234567 device usb:1-2 product:dm1q model:SM_S931B\n' ;;
   *"getprop ro.product.model"*) echo "SM-S931B" ;;
-  *"getprop ro.build.version.oneui"*) echo "90000" ;;
+  *"getprop ro.build.version.oneui"*) echo "${FAKE_ONEUI:-90000}" ;;
   *"getprop ro.build.version.sdk"*) echo "37" ;;
   *"dumpsys power"*) echo "  mWakefulness=Dozing" ;;
   *"dumpsys window policy"*) printf 'KeyguardServiceDelegate\n  showing=false\n' ;;
   *"settings get system screen_brightness_mode"*) echo 1 ;;
   *"settings get system screen_brightness"*) echo 180 ;;
-  *"settings get global enable_freeform_support"*) echo null ;;
+  *"settings get global enable_freeform_support"*) echo "${FAKE_FF:-1}" ;;
   *"wm set-display-windowing-mode"*) exit 0 ;;
   version) echo "Android Debug Bridge version 1.0.41" ;;
   *) ;;
@@ -70,8 +71,8 @@ unset DEX_DRY_RUN
 : > "$log"
 out="$(bash "$here/bin/dex" code --screen dim 2>&1)" || fail "start exit code: $out"
 expect "input keyevent KEYCODE_WAKEUP"
-expect "settings put global enable_freeform_support 1"
-expect "settings delete global enable_freeform_support"
+expect "settings put global enable_freeform_support 0" # One UI 8.5+: option off (title bar works)
+expect "settings put global enable_freeform_support 1" # restored afterwards
 expect "settings put system screen_brightness 0"
 expect "settings put system screen_brightness 180"
 expect "settings put system screen_brightness_mode 1"
@@ -79,10 +80,28 @@ expect "wm set-display-windowing-mode -d 23 5"
 echo "$out" | grep -q "Desktop windowing enabled on DeX display 23" || fail "freeform message: $out"
 awk '/wm set-display-windowing-mode/{f=1} /screen_brightness 180/{if(!f){exit 1}}' "$log" || fail "brightness restored before freeform fix"
 
+echo "# One UI 8.0: freeform option turned on and the unset value restored"
+: > "$log"
+FAKE_ONEUI=80000 FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail "One UI 8.0 start"
+expect "settings put global enable_freeform_support 1"
+expect "settings delete global enable_freeform_support"
+
+echo "# One UI 9 with the option unset: left alone"
+: > "$log"
+FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail "unset start"
+grep -q "settings put global enable_freeform_support\|settings delete global enable_freeform_support" "$log" && fail "unset option must stay untouched"
+
+echo "# config DEX_FREEFORM_SUPPORT=1 overrides the One UI default"
+: > "$log"
+echo "DEX_FREEFORM_SUPPORT=1" >> "$tmp/cfg/config"
+FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail "override start"
+expect "settings put global enable_freeform_support 1"
+sed -i.bak '/^DEX_FREEFORM_SUPPORT=/d' "$tmp/cfg/config"
+
 echo "# mirror does not touch freeform"
 : > "$log"
 bash "$here/bin/dex" mirror >/dev/null 2>&1 || fail "mirror exit"
-grep -q "enable_freeform_support 1" "$log" && fail "mirror must not change freeform support"
+grep -q "settings put global enable_freeform_support" "$log" && fail "mirror must not change freeform support"
 grep -q "wm set-display-windowing-mode" "$log" && fail "mirror must not force windowing (no New display line expected)"
 
 echo "# --no-freeform skips the fix"

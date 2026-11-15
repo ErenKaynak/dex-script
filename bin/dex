@@ -61,7 +61,7 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: $CONFIG
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
-  DEX_FREEFORM, DEX_LAST_ENDPOINT
+  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_LAST_ENDPOINT
 EOF
 }
 
@@ -223,13 +223,32 @@ dim_off() {
   SAVED_BRI=""; SAVED_BRI_MODE=""
 }
 
+# The "Enable freeform windows" developer option (global enable_freeform_support), set for the
+# session and restored on exit. One UI 8.0 builds may need it on. On One UI 8.5+/9 it is kept
+# off: with it on, the DeX title bar's drag and close/minimize/maximize buttons did nothing in a
+# field test, while sam1am/localdex gets draggable windows on One UI 9 with only the forced
+# display windowing mode and the option untouched.
 SAVED_FREEFORM_SUPPORT=""
-freeform_support_on() { # standard "Enable freeform windows" developer option, needed on some builds
-  SAVED_FREEFORM_SUPPORT="$(phone_shell settings get global enable_freeform_support)"
-  case "$SAVED_FREEFORM_SUPPORT" in
-    1) SAVED_FREEFORM_SUPPORT="" ;; # already on, nothing to restore
-    *) phone_shell settings put global enable_freeform_support 1 >/dev/null ;;
+freeform_support_set() { # freeform_support_set 0|1
+  local cur
+  cur="$(phone_shell settings get global enable_freeform_support)"
+  case "$cur" in
+    "$1"|"") return 0 ;; # already right, or unreadable
+    null) [ "$1" = 1 ] || return 0 ;; # unset means off
   esac
+  SAVED_FREEFORM_SUPPORT="$cur"
+  phone_shell settings put global enable_freeform_support "$1" >/dev/null
+  if [ "$1" = 0 ]; then
+    say "${C_DIM}Freeform developer option off while DeX runs (it breaks window dragging on One UI 8.5+).${C_OFF}"
+  fi
+}
+want_freeform_support() { # prints 0|1: config DEX_FREEFORM_SUPPORT, else by One UI version
+  local v
+  v="$(cfg_get DEX_FREEFORM_SUPPORT)"
+  case "$v" in 0|1) echo "$v"; return ;; esac
+  v="$(phone_shell getprop ro.build.version.oneui)"
+  case "$v" in [0-9]*) [ "$v" -ge 80500 ] && { echo 0; return; } ;; esac
+  echo 1
 }
 freeform_support_off() {
   case "$SAVED_FREEFORM_SUPPORT" in
@@ -375,7 +394,7 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
 
   cfg_set DEX_LAST_PROFILE "$profile"
   wake_phone
-  if [ "$FREEFORM" = 1 ]; then freeform_support_on; fi
+  if [ "$FREEFORM" = 1 ]; then freeform_support_set "$(want_freeform_support)"; fi
   if [ "$screen" = dim ]; then dim_on; fi
   trap 'restore_phone' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
   say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen)..."
@@ -528,7 +547,9 @@ cmd_doctor() {
   fi
   wk="$(phone_shell dumpsys power | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -n 1)"
   [ -n "$wk" ] && say "power:   $wk"
-  say "freeform support: $(phone_shell settings get global enable_freeform_support)"
+  local ffs
+  ffs="$(phone_shell settings get global enable_freeform_support)"
+  say "freeform support: $ffs (dex sets it to $(want_freeform_support) while DeX runs)"
   return 0
 }
 

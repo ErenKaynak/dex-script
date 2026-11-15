@@ -98,9 +98,14 @@ selection, loops until `q`:
 2. **Wake**: `dumpsys power` → if `mWakefulness=Asleep|Dozing` inject `KEYCODE_WAKEUP` and wait 1 s
    (scrcpy 5.0.1 never powers on the device for a new virtual display; a dozing Galaxy renders
    nothing). `dumpsys window policy` → KeyguardServiceDelegate `showing=true` → warn "unlock".
-3. **Freeform prerequisite** (unless `--no-freeform` / `DEX_FREEFORM=0` / mirror): if
-   `settings get global enable_freeform_support` ≠ 1, set it to 1; restore the original value
-   (`null` → `settings delete`) after scrcpy exits.
+3. **Freeform developer option** (unless `--no-freeform` / `DEX_FREEFORM=0` / mirror): wanted
+   value of `enable_freeform_support` = config `DEX_FREEFORM_SUPPORT` (0|1) if set, else **0 on
+   One UI 8.5+** (`ro.build.version.oneui` ≥ 80500) and 1 otherwise. If the current value differs
+   (`null` counts as 0), set it and restore the original after scrcpy exits (`null` →
+   `settings delete`). Why 0 on 8.5+/9: with the option on, the field test (S25, One UI 9) got
+   freeform windows whose title bar could not be dragged and whose close/minimize/maximize
+   buttons did nothing; sam1am/localdex reports draggable windows on One UI 9 with the same
+   server and windowing-mode fix and the option untouched. Not yet verified on device.
 4. **Screen mode**: `dim` → save `screen_brightness` + `screen_brightness_mode`, set mode 0 and
    brightness 0, restore after exit (also on Ctrl+C). `off` → scrcpy `--turn-screen-off`.
 5. Run scrcpy with stdout+stderr streamed to the console and watched line by line. On
@@ -178,7 +183,7 @@ Over Wi-Fi lower defaults: bit-rate × 0.5 (code 8M, school 6M, movie 12M), keep
 
 Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_SHORTCUT_MOD`, `DEX_DPI`,
 `DEX_RES`, `DEX_EXTRA_ARGS`, `DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM`
-(0|1), `DEX_KEYBOARD_HINT_SHOWN`. Write config safely (replace key line or append).
+(0|1), `DEX_FREEFORM_SUPPORT` (0|1, unset = by One UI version), `DEX_KEYBOARD_HINT_SHOWN`. Write config safely (replace key line or append).
 
 Screen size detection: Linux `xrandr --current` (primary or first connected) or
 `xdpyinfo`; Wayland fallback 1600x900. macOS: `system_profiler SPDisplaysDataType` ("Resolution:"
