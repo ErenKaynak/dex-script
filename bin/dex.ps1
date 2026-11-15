@@ -19,7 +19,7 @@ $script:serial = ''; $script:transport = ''; $script:usbList = @(); $script:tcpL
 $script:savedFf = ''; $script:savedBri = ''; $script:savedBriMode = ''; $script:lastConnectMsg = ''
 $script:tuiSeen = ''; $script:tuiModel = ''; $script:tuiMsg = @('', 'DarkGray'); $script:scrcpyVer = ''
 $script:menuBottom = 0; $script:col = 0; $script:frameW = 80
-$script:savedDesktop = ''; $script:debugLog = ''; $script:logcatProcess = $null
+$script:savedDesktop = ''; $script:debugLog = ''; $script:logcatProcess = $null; $script:savedAccel = ''
 $script:overlayId = ''
 $script:adbExit = 0
 $script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Mouse = ''; Display = ''; Server = ''; Debug = $false; Raw = @() }
@@ -131,6 +131,9 @@ Config: {CONFIG}
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
   DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
   DEX_DISPLAY (auto|overlay|virtual), DEX_SERVER (auto|patched|stock), DEX_MOUSE (uhid|sdk),
+  DEX_MOUSE_ACCEL (0|1, default 0: phone mouse acceleration off while DeX runs with the uhid mouse),
+  DEX_VIDEO_BUFFER (ms; Wi-Fi default 0 with the uhid mouse, 50 with sdk),
+  DEX_IME (hide|local|fallback|default; default hide: no on-screen keyboard on the DeX screen),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 '@
@@ -417,6 +420,17 @@ function Invoke-ForceDesktop {
     Invoke-Phone @('settings', 'put', 'global', 'force_desktop_mode_on_external_displays', '1') | Out-Null
     Write-Host 'force_desktop_mode_on_external_displays=1 while DeX runs (DEX_FORCE_DESKTOP).' -ForegroundColor DarkGray
 }
+# Android's mouse acceleration uses event timestamps; over Wi-Fi the HID mouse moves arrive in
+# bursts, look like a fast flick and throw the pointer across the screen. Off for the session with
+# the uhid mouse (DEX_MOUSE_ACCEL=1 keeps it); unset means Android's default (on).
+function Disable-MouseAcceleration {
+    if ((Get-Cfg 'DEX_MOUSE_ACCEL') -eq '1') { return }
+    $value = Get-PhoneValue @('settings', 'get', 'system', 'mouse_pointer_acceleration_enabled')
+    if (!$value -or $value -eq '0') { return }
+    $script:savedAccel = $value
+    Invoke-Phone @('settings', 'put', 'system', 'mouse_pointer_acceleration_enabled', '0') | Out-Null
+    Write-Host 'Phone mouse acceleration off while DeX runs (smooth pointer over Wi-Fi; DEX_MOUSE_ACCEL=1 keeps it).' -ForegroundColor DarkGray
+}
 function Invoke-PhoneRestore {
     if ($script:savedBri -match '^\d+$') { Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', $script:savedBri) | Out-Null }
     if ($script:savedBriMode -match '^\d+$') { Invoke-Phone @('settings', 'put', 'system', 'screen_brightness_mode', $script:savedBriMode) | Out-Null }
@@ -424,6 +438,9 @@ function Invoke-PhoneRestore {
     elseif ($script:savedFf) { Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', $script:savedFf) | Out-Null }
     if ($script:savedDesktop -eq 'null') { Invoke-Phone @('settings', 'delete', 'global', 'force_desktop_mode_on_external_displays') | Out-Null }
     elseif ($script:savedDesktop) { Invoke-Phone @('settings', 'put', 'global', 'force_desktop_mode_on_external_displays', $script:savedDesktop) | Out-Null }
+    if ($script:savedAccel -eq 'null') { Invoke-Phone @('settings', 'delete', 'system', 'mouse_pointer_acceleration_enabled') | Out-Null }
+    elseif ($script:savedAccel) { Invoke-Phone @('settings', 'put', 'system', 'mouse_pointer_acceleration_enabled', $script:savedAccel) | Out-Null }
+    $script:savedAccel = ''
     Invoke-OverlayDestroy
     $script:savedDesktop = ''
     $script:savedBri = ''; $script:savedBriMode = ''; $script:savedFf = ''
@@ -573,12 +590,26 @@ function Invoke-DexStart([string]$Kind) {
         if ($display -eq 'overlay') { $scrcpyArgs += '--display-id=OVERLAY' }
         else { $scrcpyArgs += @("--new-display=$res/$dpi", '--flex-display', '--no-vd-destroy-content') }
         $scrcpyArgs += @('--keyboard=uhid', "--mouse=$mouse", '--mouse-bind=++++:bhsn')
+        # The PC keyboard is a real (UHID) keyboard: hide the phone's on-screen keyboard on the DeX
+        # screen (typing keeps working). scrcpy restores the policy on exit. DEX_IME overrides.
+        $ime = Get-Cfg 'DEX_IME'
+        if ($ime -eq 'default') { $ime = '' }
+        elseif ($ime -notmatch '^(local|fallback|hide)$') { $ime = 'hide' }
+        if ($ime) { $scrcpyArgs += "--display-ime-policy=$ime" }
     }
     $scrcpyArgs += @("--window-title=Galaxy DeX ($Kind)", "--shortcut-mod=$mod")
     # --keep-active keeps the phone awake on USB and Wi-Fi; --stay-awake only works when plugged in.
     $scrcpyArgs += @('--keep-active', '--disable-screensaver', '--max-fps=60', "--video-bit-rate=${bitrate}M")
     if ($script:transport -eq 'usb') { $scrcpyArgs += '--stay-awake' }
-    if ($script:transport -eq 'wifi') { $scrcpyArgs += '--video-buffer=50' } # absorbs Wi-Fi jitter
+    if ($script:transport -eq 'wifi') {
+        # With the uhid mouse the pointer is drawn by the phone and travels inside the video, so a
+        # video buffer is pointer lag: 0 then, 50 ms with the sdk mouse. DEX_VIDEO_BUFFER overrides.
+        $videoBuffer = Get-Cfg 'DEX_VIDEO_BUFFER'
+        if ($videoBuffer -notmatch '^\d+$') {
+            if ($Kind -ne 'mirror' -and $mouse -eq 'uhid') { $videoBuffer = '0' } else { $videoBuffer = '50' }
+        }
+        if ($videoBuffer -ne '0') { $scrcpyArgs += "--video-buffer=$videoBuffer" }
+    }
     if ($Kind -eq 'mirror') { $scrcpyArgs += '--keyboard=uhid' } else { $scrcpyArgs += @("--video-codec=$codec") + $extraProfile }
     if ($screen -eq 'off') { $scrcpyArgs += '--turn-screen-off' }
     if ($fullscreen -eq '1') { $scrcpyArgs += '--fullscreen' }
@@ -603,6 +634,7 @@ function Invoke-DexStart([string]$Kind) {
     Invoke-WakePhone
     try {
         if ($watch) { Invoke-FreeformSupport (Get-WantedFreeformSupport); Invoke-ForceDesktop }
+        if ($Kind -ne 'mirror' -and $mouse -eq 'uhid') { Disable-MouseAcceleration }
         if ($screen -eq 'dim') { Invoke-DimOn }
         if ($display -eq 'overlay') {
             if (Invoke-OverlayCreate $res $dpi) {
@@ -760,6 +792,7 @@ function Invoke-Doctor {
     Write-Host "display mode:     $(Get-WantedDisplay) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
     Write-Host "force desktop:    $(Get-PhoneValue @('settings', 'get', 'global', 'force_desktop_mode_on_external_displays')) (DEX_FORCE_DESKTOP=$(Get-Cfg 'DEX_FORCE_DESKTOP'))"
     Write-Host "mouse mode:       $(Get-WantedMouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
+    Write-Host "mouse accel:      $(Get-PhoneValue @('settings', 'get', 'system', 'mouse_pointer_acceleration_enabled')) (dex turns it off while DeX runs with uhid unless DEX_MOUSE_ACCEL=1)"
     $remembered = Get-RememberedPhone
     if ($remembered) { Write-Host "remembered: $remembered" }
     return 0

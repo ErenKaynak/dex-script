@@ -211,7 +211,17 @@ Common to all DeX profiles (never restrict resizing or multitasking):
 - `--keep-active`: simulated user activity; keeps the phone from sleeping on USB *and* Wi-Fi
   without changing settings. A sleeping phone stops rendering the virtual display ("DeX frozen").
   `--stay-awake` (`stay_on_while_plugged_in`) only works when plugged in, so it is USB-only.
-- `--video-buffer=50` over Wi-Fi absorbs jitter, the main cause of stutter/"unresponsive" sessions.
+- Wi-Fi video buffer: 50 ms with the sdk mouse (absorbs jitter), **0 with the uhid mouse**: the
+  uhid pointer is drawn by the phone and travels inside the video, so any buffer is pointer lag.
+  Config `DEX_VIDEO_BUFFER` (ms) overrides. Measured: phone ping 34-48 ms on the user's LAN.
+- uhid mouse sessions set `system mouse_pointer_acceleration_enabled` to 0 (Android 16+, applied
+  live by `InputSettingsObserver`; unset = default on) and restore it (`null` → delete). Why:
+  acceleration uses event timestamps, Wi-Fi delivers HID moves in bursts, Android sees a fast
+  flick and the pointer "teleports". `DEX_MOUSE_ACCEL=1` keeps it.
+- `--display-ime-policy=hide` on DeX profiles (config `DEX_IME` = hide|local|fallback|default):
+  with the UHID keyboard Samsung Keyboard still opened the on-screen keyboard for each text
+  field. Hide = no IME window on that display; key events go to the app; scrcpy's cleanup
+  restores the display's policy.
 - `--turn-screen-off` is opt-in (`--screen off`): on some Galaxy phones the panel-off puts the
   phone into doze and the DeX display freezes; `dex wake` recovers. Default `on`, `dim` is the safe
   "dark phone" alternative (brightness 0, restored afterwards).
@@ -255,7 +265,8 @@ Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_LAST_IP`,
 (0|1, unset = by One UI version), `DEX_DISPLAY` (overlay|virtual, unset = by One UI/Android
 version), `DEX_SERVER` (patched|stock, unset = patched when installed on SDK ≥ 37), `DEX_MOUSE`
 (uhid|sdk, unset = by Android version),
-`DEX_FORCE_DESKTOP` (0|1), `DEX_LAST_PROFILE`, `DEX_KEYBOARD_HINT_SHOWN`. Write config safely
+`DEX_FORCE_DESKTOP` (0|1), `DEX_MOUSE_ACCEL` (0|1), `DEX_VIDEO_BUFFER` (ms), `DEX_IME`
+(hide|local|fallback|default), `DEX_LAST_PROFILE`, `DEX_KEYBOARD_HINT_SHOWN`. Write config safely
 (replace key line or append).
 
 Screen size detection: Linux `xrandr --current` (primary or first connected) or

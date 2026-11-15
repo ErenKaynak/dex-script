@@ -16,7 +16,8 @@ cat > "$tmp/bin/adb" <<'EOF'
 # FAKE_ONEUI / FAKE_FF override the One UI version and the freeform option value.
 printf 'adb %s\n' "$*" >> "$FAKE_LOG"
 case "$*" in
-  "devices -l") printf 'List of devices attached\nR5CX1234567 device usb:1-2 product:dm1q model:SM_S931B\n' ;;
+  "devices -l") if [ -n "${FAKE_WIFI:-}" ]; then printf 'List of devices attached\n192.168.1.5:37123 device product:dm1q model:SM_S931B\n'; else printf 'List of devices attached\nR5CX1234567 device usb:1-2 product:dm1q model:SM_S931B\n'; fi ;;
+  *"settings get system mouse_pointer_acceleration_enabled"*) echo "${FAKE_ACCEL:-null}" ;;
   *"getprop ro.product.model"*) echo "SM-S931B" ;;
   *"getprop ro.product.marketname"*) echo "Galaxy S25" ;;
   *"getprop ro.serialno"*) echo "R5CX1234567" ;;
@@ -87,6 +88,27 @@ grep -q -- "--stay-awake" <<< "$out" || fail "--stay-awake missing on USB"
 grep -q -- "--video-bit-rate=16M" <<< "$out" || fail "code bitrate"
 grep -q -- "--turn-screen-off" <<< "$out" && fail "dim mode must not pass --turn-screen-off"
 grep -q -- "--mouse=uhid --mouse-bind=++++:bhsn" <<< "$out" || fail "Android 15+: real HID mouse on the DeX display: $out"
+grep -q -- "--display-ime-policy=hide" <<< "$out" || fail "on-screen keyboard hidden on the DeX screen by default: $out"
+grep -q -- "--video-buffer" <<< "$out" && fail "USB: no video buffer: $out"
+
+echo "# Wi-Fi: no video buffer with the uhid mouse (pointer travels in the video), 50 ms with sdk"
+out="$(FAKE_WIFI=1 bash "$here/bin/dex" code --display virtual 2>&1)" || fail "wifi dry run: $out"
+grep -q -- "--video-buffer" <<< "$out" && fail "wifi + uhid must not buffer video: $out"
+grep -q -- "--video-bit-rate=8M" <<< "$out" || fail "wifi halves the bitrate: $out"
+out="$(FAKE_WIFI=1 bash "$here/bin/dex" code --display virtual --mouse sdk 2>&1)"
+grep -q -- "--video-buffer=50" <<< "$out" || fail "wifi + sdk keeps the 50 ms buffer: $out"
+echo "DEX_VIDEO_BUFFER=30" >> "$tmp/cfg/config"
+out="$(FAKE_WIFI=1 bash "$here/bin/dex" code --display virtual 2>&1)"
+grep -q -- "--video-buffer=30" <<< "$out" || fail "DEX_VIDEO_BUFFER override: $out"
+sed -i.bak '/^DEX_VIDEO_BUFFER=/d' "$tmp/cfg/config"
+
+echo "# DEX_IME=default leaves the IME policy alone; mirror never passes it"
+echo "DEX_IME=default" >> "$tmp/cfg/config"
+out="$(bash "$here/bin/dex" code 2>&1)"
+grep -q -- "--display-ime-policy" <<< "$out" && fail "DEX_IME=default: $out"
+sed -i.bak '/^DEX_IME=/d' "$tmp/cfg/config"
+out="$(bash "$here/bin/dex" mirror 2>&1)"
+grep -q -- "--display-ime-policy" <<< "$out" && fail "mirror has no secondary display: $out"
 
 echo "# --mouse sdk / config DEX_MOUSE / old Android fall back to sdk"
 out="$(bash "$here/bin/dex" code --mouse sdk 2>&1)"
@@ -124,8 +146,25 @@ expect "settings put system screen_brightness 0"
 expect "settings put system screen_brightness 180"
 expect "settings put system screen_brightness_mode 1"
 grep -q "Overlay display 31 created" <<< "$out" || fail "overlay message: $out"
+expect "settings put system mouse_pointer_acceleration_enabled 0" # unset = Android default on
+expect "settings delete system mouse_pointer_acceleration_enabled" # back to unset on exit
 [ -e "$log.overlay" ] && fail "overlay display must be removed on exit"
 awk '/scrcpy -s/{f=1} /settings delete global overlay_display_devices/{if(!f){exit 1}}' "$log" || fail "overlay removed only after scrcpy"
+
+echo "# uhid mouse: phone mouse acceleration off for the session, restored on exit"
+: > "$log"
+FAKE_ACCEL=1 bash "$here/bin/dex" code >/dev/null 2>&1 || fail "accel start"
+expect "settings put system mouse_pointer_acceleration_enabled 0"
+expect "settings put system mouse_pointer_acceleration_enabled 1"
+awk '/scrcpy -s/{f=1} /mouse_pointer_acceleration_enabled 1/{if(!f){exit 1}}' "$log" || fail "acceleration restored before scrcpy ran"
+: > "$log"
+FAKE_ACCEL=1 bash "$here/bin/dex" code --mouse sdk >/dev/null 2>&1 || fail "sdk start"
+grep -q "mouse_pointer_acceleration_enabled 0" "$log" && fail "sdk mouse must not touch acceleration"
+echo "DEX_MOUSE_ACCEL=1" >> "$tmp/cfg/config"
+: > "$log"
+FAKE_ACCEL=1 bash "$here/bin/dex" code >/dev/null 2>&1 || fail "accel keep start"
+grep -q "mouse_pointer_acceleration_enabled 0" "$log" && fail "DEX_MOUSE_ACCEL=1 keeps acceleration"
+sed -i.bak '/^DEX_MOUSE_ACCEL=/d' "$tmp/cfg/config"
 
 echo "# full start, virtual display: freeform fix on New display"
 : > "$log"

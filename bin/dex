@@ -81,6 +81,9 @@ Config: $CONFIG
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
   DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
   DEX_DISPLAY (auto|overlay|virtual), DEX_SERVER (auto|patched|stock), DEX_MOUSE (uhid|sdk),
+  DEX_MOUSE_ACCEL (0|1, default 0: phone mouse acceleration off while DeX runs with the uhid mouse),
+  DEX_VIDEO_BUFFER (ms; Wi-Fi default 0 with the uhid mouse, 50 with sdk),
+  DEX_IME (hide|local|fallback|default; default hide: no on-screen keyboard on the DeX screen),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 EOF
@@ -436,7 +439,31 @@ mod_name() { # human name of the shortcut mod
   case "$1" in lsuper|rsuper) echo "Cmd" ;; lctrl|rctrl) echo "Ctrl" ;; *) echo "Alt" ;; esac
 }
 
-restore_phone() { dim_off; freeform_support_off; force_desktop_off; overlay_destroy; }
+# Android's mouse acceleration (Android 16+ setting, applied live) computes speed from event
+# timestamps. Over Wi-Fi the HID mouse moves reach the phone in bursts with almost the same
+# timestamp, so Android sees a very fast flick and throws the pointer across the screen
+# ("teleporting"). Off for the session with the uhid mouse (config DEX_MOUSE_ACCEL=1 keeps it),
+# restored on exit. The PC already applies its own pointer acceleration.
+SAVED_MOUSE_ACCEL=""
+mouse_accel_off() {
+  [ "$(cfg_get DEX_MOUSE_ACCEL)" = 1 ] && return 0
+  local cur
+  cur="$(phone_shell settings get system mouse_pointer_acceleration_enabled)"
+  case "$cur" in 0|"") return 0 ;; esac # already off, or unreadable
+  SAVED_MOUSE_ACCEL="$cur"
+  phone_shell settings put system mouse_pointer_acceleration_enabled 0 >/dev/null
+  say "${C_DIM}Phone mouse acceleration off while DeX runs (smooth pointer over Wi-Fi; DEX_MOUSE_ACCEL=1 keeps it).${C_OFF}"
+}
+mouse_accel_restore() {
+  case "$SAVED_MOUSE_ACCEL" in
+    "") ;;
+    null) phone_shell settings delete system mouse_pointer_acceleration_enabled >/dev/null ;;
+    *) phone_shell settings put system mouse_pointer_acceleration_enabled "$SAVED_MOUSE_ACCEL" >/dev/null ;;
+  esac
+  SAVED_MOUSE_ACCEL=""
+}
+
+restore_phone() { dim_off; freeform_support_off; force_desktop_off; overlay_destroy; mouse_accel_restore; }
 
 # --- screen size --------------------------------------------------------------------
 detect_screen() { # prints "WxH" or nothing
@@ -586,13 +613,32 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
       args+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content)
     fi
     args+=(--keyboard=uhid "--mouse=$mouse" --mouse-bind=++++:bhsn)
+    # The PC keyboard is a real (UHID) keyboard, so the phone's on-screen keyboard is never
+    # needed on the DeX screen; Samsung Keyboard would still pop up for every text field.
+    # "hide" keeps typing working (key events go straight to the app). scrcpy restores the
+    # display's policy on exit. DEX_IME=local|fallback shows it, default leaves Android's choice.
+    local ime
+    ime="$(cfg_get DEX_IME)"
+    case "$ime" in local|fallback|hide) ;; default) ime="" ;; *) ime=hide ;; esac
+    if [ -n "$ime" ]; then args+=("--display-ime-policy=$ime"); fi
   fi
   args+=("--window-title=Galaxy DeX ($profile)" "--shortcut-mod=$mod")
   # --keep-active: simulated user activity keeps the phone from sleeping on USB *and* Wi-Fi
   # (a sleeping phone stops rendering the DeX display). --stay-awake only works when plugged in.
   args+=(--keep-active --disable-screensaver --max-fps=60 "--video-bit-rate=${bitrate}M")
   if [ "$TRANSPORT" = "usb" ]; then args+=(--stay-awake); fi
-  if [ "$TRANSPORT" = "wifi" ]; then args+=(--video-buffer=50); fi # absorbs Wi-Fi jitter (stutter/freezes)
+  if [ "$TRANSPORT" = "wifi" ]; then
+    # A video buffer absorbs Wi-Fi jitter, but with the uhid mouse the pointer is drawn by the
+    # phone and travels inside the video, so every ms of buffer is pointer lag. 0 then; 50 ms
+    # with the sdk mouse (local PC pointer). DEX_VIDEO_BUFFER overrides.
+    local vbuf
+    vbuf="$(cfg_get DEX_VIDEO_BUFFER)"
+    case "$vbuf" in
+      [0-9]*) ;;
+      *) if [ "$profile" != mirror ] && [ "$mouse" = uhid ]; then vbuf=0; else vbuf=50; fi ;;
+    esac
+    if [ "$vbuf" != 0 ]; then args+=("--video-buffer=$vbuf"); fi
+  fi
   if [ "$profile" = "mirror" ]; then
     args+=(--keyboard=uhid)
   else
@@ -622,6 +668,7 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   remember_phone
   wake_phone
   if [ "$FREEFORM" = 1 ]; then freeform_support_set "$(want_freeform_support)"; force_desktop_on; fi
+  if [ "$profile" != mirror ] && [ "$mouse" = uhid ]; then mouse_accel_off; fi
   if [ "$screen" = dim ]; then dim_on; fi
   trap 'restore_phone; debug_stop' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
   if [ "$display" = overlay ]; then
@@ -833,6 +880,7 @@ cmd_doctor() {
   say "display mode:     $(want_display) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
   say "force desktop:    $(phone_shell settings get global force_desktop_mode_on_external_displays) (DEX_FORCE_DESKTOP=$(cfg_get DEX_FORCE_DESKTOP))"
   say "mouse mode:       $(want_mouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
+  say "mouse accel:      $(phone_shell settings get system mouse_pointer_acceleration_enabled) (dex turns it off while DeX runs with uhid unless DEX_MOUSE_ACCEL=1)"
   local rp
   if rp="$(remembered_phone)"; then say "remembered: $rp"; fi
   return 0

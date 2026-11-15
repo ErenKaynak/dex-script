@@ -119,7 +119,8 @@ multitasking. Closing the window doesn't kill your apps; they move back to the p
 
 Settings persist in `~/.config/dex/config` (Windows: `%APPDATA%\dex\config`), e.g.
 `DEX_SCREEN=dim`, `DEX_FULLSCREEN=1`, `DEX_DPI=150`, `DEX_RES=2560x1440`, `DEX_SHORTCUT_MOD=lalt`,
-`DEX_MOUSE=sdk`, `DEX_DISPLAY=virtual`, `DEX_SERVER=stock`, `DEX_EXTRA_ARGS=...`. The menu keys
+`DEX_MOUSE=sdk`, `DEX_MOUSE_ACCEL=1`, `DEX_VIDEO_BUFFER=50`, `DEX_IME=local`, `DEX_DISPLAY=virtual`,
+`DEX_SERVER=stock`, `DEX_EXTRA_ARGS=...`. The menu keys
 `s`, `f`, `r`, `m`, `o` and `v` write these for you.
 
 ### Windows on One UI 8.5 / 9: patched server or overlay display
@@ -235,7 +236,20 @@ YouTube, local video files, Plex/Jellyfin and most non-DRM players work fine in 
   keeps DeX running behind the lock screen but blocks typing until you unlock.
 - **"unauthorized"**: unlock the phone and accept the *Allow USB debugging* prompt.
 - **Wrong characters when typing**: run `dex keyboard` → choose Turkish Q.
-- **Laggy over Wi-Fi**: use 5 GHz Wi-Fi, or `dex --res 1600x900`, or USB.
+- **Laggy pointer or blurry picture over Wi-Fi**: with the real HID mouse (`uhid`) the pointer is
+  drawn by the phone, so every mouse move goes PC → phone and comes back inside the video.
+  Its lag is the Wi-Fi round trip plus encoding, and the picture uses half the USB bitrate
+  (8 Mbit/s in `code`) so big redraws get blocky. Video and mouse share one adb connection,
+  so a large video frame briefly holds the mouse packets back. `dex` already removes the
+  50 ms video buffer with `uhid` and turns off the phone's mouse acceleration for the session
+  (bursts of delayed moves made the pointer jump far). What helps most after that: 5 GHz
+  Wi-Fi close to the router, the phone and PC on the same network (no VPN), a smaller
+  `--res 1600x900`, or the USB cable. To trade sharpness for bandwidth set e.g.
+  `DEX_EXTRA_ARGS=--video-bit-rate=12M`, or try `m` → `sdk`: the pointer is then drawn by the
+  PC and has no lag at all.
+- **The on-screen keyboard pops up for every text field**: `dex` hides it on the DeX screen
+  (`--display-ime-policy=hide`); your PC keyboard keeps typing. Set `DEX_IME=local` to get it
+  back inside DeX, or `DEX_IME=default` to leave Android's choice.
 
 ## How it works
 
