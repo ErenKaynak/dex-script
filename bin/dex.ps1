@@ -816,7 +816,7 @@ function Invoke-Gui {
         $icon = if ($Failure) { 'Error' } else { 'Information' }
         [void][System.Windows.Forms.MessageBox]::Show($gui.Form, $Text, 'erka-dex', 'OK', $icon)
     }
-    function Update-GuiStatus {
+    function Sync-GuiStatus {
         $screen = Get-Cfg 'DEX_SCREEN'
         if ($screen -notin @('on', 'dim', 'off')) { $screen = 'on' }
         $start = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { 'fullscreen' } else { 'window' }
@@ -908,7 +908,7 @@ function Invoke-Gui {
         } catch { Show-GuiMessage $_.Exception.Message -Failure }
         finally {
             $gui.Form.Enabled = $true
-            Update-GuiStatus
+            Sync-GuiStatus
             $timer.Start()
         }
     }
@@ -940,12 +940,12 @@ function Invoke-Gui {
                     'screen' {
                         $next = switch (Get-Cfg 'DEX_SCREEN') { 'dim' { 'off' }; 'off' { 'on' }; default { 'dim' } }
                         Save-ConfigValue 'DEX_SCREEN' $next
-                        Update-GuiStatus
+                        Sync-GuiStatus
                     }
                     'window' {
                         $next = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { '0' } else { '1' }
                         Save-ConfigValue 'DEX_FULLSCREEN' $next
-                        Update-GuiStatus
+                        Sync-GuiStatus
                     }
                     default { Invoke-GuiAction ([string]$sender.Tag) }
                 }
@@ -958,9 +958,9 @@ function Invoke-Gui {
     }
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 5000
-    $timer.Add_Tick({ Update-GuiStatus })
+    $timer.Add_Tick({ Sync-GuiStatus })
     try {
-        Update-GuiStatus
+        Sync-GuiStatus
         $timer.Start()
         [void]$gui.Form.ShowDialog()
     } finally {
