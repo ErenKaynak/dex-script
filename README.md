@@ -63,7 +63,7 @@ the last profile):
   │ Galaxy DeX on your PC                       scrcpy 5.0.1 │
   ├──────────────────────────────────────────────────────────┤
   │ Phone    Galaxy S25 · One UI 9.0 · USB               87% │
-  │ Settings phone on · window · 1536x864 auto @ auto        │
+  │ Settings phone on · window · mouse auto · 1536x864 @ auto│
   ├──────────────────────────────────────────────────────────┤
   │  1  Code      crisp text: coding, T3, browser       last │
   │  2  School    more room: Word / Excel side by side       │
@@ -77,8 +77,10 @@ the last profile):
   │  s  Screen    phone panel while DeX runs: on / dim / off │
   │  f  Window    toggle window / fullscreen start           │
   │  r  Size      set window size and DPI                    │
+  │  m  Mouse     real HID mouse (uhid) / touch (sdk)        │
   │  d  Doctor    versions, devices, One UI check            │
   │  x  Wake      unfreeze a stuck DeX window                │
+  │  l  Log       start Code with a phone log (bug reports)  │
   │  u  Update    re-run the installer                       │
   │  q  Quit                                                 │
   ╰──────────────────────────────────────────────────────────╯
@@ -94,24 +96,36 @@ Everything is also a plain command, for scripts and shortcuts:
 | `dex school` | DeX with more workspace (Word / Excel side by side) |
 | `dex movie` | DeX with higher bitrate + H.265 + smoother audio |
 | `dex mirror` | Plain phone-screen mirror, no DeX |
-| `dex pair` | Wireless pairing with a 6-digit code (no cable) |
-| `dex connect [ip:port]` | Reconnect over Wi-Fi (auto-discovers the phone) |
+| `dex pair` | Wireless pairing with a 6-digit code (no cable). Once per PC: `dex` remembers the phone |
+| `dex connect [ip:port]` | Reconnect over Wi-Fi (auto-discovers the phone; a remembered phone only needs the new port) |
 | `dex wifi` | USB plugged → switch to Wi-Fi, then unplug (until phone reboot) |
 | `dex wake` | Wake the phone / unfreeze a stuck DeX window |
 | `dex keyboard` | Open the phone's physical keyboard settings |
-| `dex doctor` | Show versions, devices, One UI version, power state |
+| `dex doctor` | Show versions, devices, One UI version, power state, mouse mode |
+| `dex debug` | Start DeX with a phone log for bug reports (see Troubleshooting) |
 | `dex update` / `dex uninstall` | Update or remove everything |
 
 Options: `--res 1920x1080`, `--dpi 140`, `--usb`, `--wifi`, `--screen on|dim|off`,
 `--fullscreen` (start at your monitor's resolution, like a real DeX monitor), `--no-freeform`,
-and `-- <extra scrcpy args>`.
+`--mouse uhid|sdk`, `--debug`, and `-- <extra scrcpy args>`.
 
 Profiles only change quality settings. Every profile keeps the window resizable and DeX fully
 multitasking. Closing the window doesn't kill your apps; they move back to the phone.
 
 Settings persist in `~/.config/dex/config` (Windows: `%APPDATA%\dex\config`), e.g.
 `DEX_SCREEN=dim`, `DEX_FULLSCREEN=1`, `DEX_DPI=150`, `DEX_RES=2560x1440`, `DEX_SHORTCUT_MOD=lalt`,
-`DEX_EXTRA_ARGS=...`. The menu keys `s`, `f` and `r` write these for you.
+`DEX_MOUSE=sdk`, `DEX_EXTRA_ARGS=...`. The menu keys `s`, `f`, `r` and `m` write these for you.
+
+### Mouse: why the DeX window captures your pointer
+
+Since One UI 8.5, DeX window title bars (drag, minimize / maximize / close, edge resizing) react
+to a **mouse**, but treat injected touch-style clicks like finger taps (tap-and-hold to move) or
+ignore them. So `dex` makes scrcpy create a **real HID mouse on the phone** (`--mouse=uhid`) and
+bind it to the DeX display: DeX sees exactly what it sees with a mouse plugged into a DeX dock.
+The price is that the DeX window *captures* the PC pointer while it has focus. **Press Alt**
+(Cmd on macOS) to give the pointer back to the PC, click the window to capture it again. If you
+prefer the old behaviour (pointer never captured, title bars may not drag), press `m` in the menu
+or use `--mouse sdk`. Android 14 and older phones fall back to `sdk` automatically.
 
 ### Phone screen while DeX runs
 
@@ -131,13 +145,20 @@ scrcpy shortcuts use **Left Alt** (Linux/Windows) or **Cmd** (macOS): `MOD+f` fu
 `MOD+Shift+r` reset the video if it hangs. Right Alt (AltGr) is left alone so Turkish Q characters
 like `@ # € |` type normally. Copy/paste between PC and phone syncs automatically.
 
-## Wi-Fi at school
+## Wi-Fi: pair once, then just connect
 
-School PCs forget the pairing on every reboot, so each session:
+Pairing is needed **once per PC**: the phone keeps the PC's key (Wireless debugging → *Paired
+devices*) and `dex` remembers the phone (name, serial, last IP). What changes is the *connect
+port*: Android picks a new one every time Wireless debugging restarts or the phone reboots.
 
-1. Phone → Developer options → **Wireless debugging** → **Pair device with pairing code**.
-2. On the PC: run the one-liner, then `dex`, press `p`, and type the IP:port and the 6-digit code.
-3. Press `2` (School).
+- Same Wi-Fi, port unchanged → `dex` finds the phone by itself (mDNS or the last address).
+- Port changed → the menu says "not connected: Galaxy S25 (last at 192.168.1.5) · c = connect".
+  Press `c` and type the port shown under Wireless debugging → **IP address & Port**. No code.
+- Only if the phone forgot the PC (e.g. you removed it from *Paired devices*, or a school PC was
+  wiped): `p` to pair again.
+
+School PCs reset on every reboot, so there each session is: run the one-liner, `dex`, `p`,
+type the pairing IP:port + 6-digit code, then `2` (School).
 
 If pairing times out, the school Wi-Fi probably isolates devices from each other. Options:
 
@@ -168,6 +189,14 @@ YouTube, local video files, Plex/Jellyfin and most non-DRM players work fine in 
   when the DeX display appears (you'll see "Desktop windowing enabled on DeX display N"). Apps that
   were already open before that line stay fullscreen: close and reopen them. If the line never
   shows up, run `dex doctor` and check the One UI version.
+- **Windows open as windows, but the title bar can't be dragged and its buttons do nothing**:
+  make sure the mouse mode is `uhid` (`dex doctor` shows it; menu `m` toggles it) and that the
+  pointer is captured (click inside the window). If it still fails: try `m` once more (`sdk`),
+  then put `DEX_FORCE_DESKTOP=1` in the config (Android's "force desktop mode on external
+  displays" developer setting, set only while DeX runs). Still stuck? Press `l` (or `dex debug`),
+  open an app, try to drag its title bar and press its buttons, close DeX, and open an issue
+  with the `debug-*.log.filtered` and `.dumpsys` files from `~/.config/dex`
+  (Windows: `%APPDATA%\dex`).
 - **Window frozen / unresponsive**: the phone went to sleep or locked. `dex wake` (menu `x`), unlock
   the phone, or press `Alt+Shift+r` in the window. Over Wi-Fi, `dex` already adds a 50 ms video
   buffer and halves the bitrate; on a bad network use 5 GHz, `--res 1600x900`, or USB.
@@ -183,9 +212,10 @@ YouTube, local video files, Plex/Jellyfin and most non-DRM players work fine in 
 
 `install.sh` / `install.ps1` download the pinned official scrcpy release (it bundles `adb`),
 verify its SHA-256, and install the `dex` wrapper. The wrapper picks the device (USB first, then
-Wi-Fi via mDNS / last known address), wakes the phone, and starts scrcpy with
-`--new-display=WxH/DPI --flex-display --no-vd-destroy-content --keyboard=uhid --keep-active` plus
-the profile settings. While scrcpy runs, `dex` watches its log for the new display id and runs
+Wi-Fi via mDNS / last known address / the remembered phone), wakes the phone, and starts scrcpy
+with `--new-display=WxH/DPI --flex-display --no-vd-destroy-content --keyboard=uhid --mouse=uhid
+--keep-active` plus the profile settings (the UHID mouse is bound to the virtual display, Android
+15+). While scrcpy runs, `dex` watches its log for the new display id and runs
 `wm set-display-windowing-mode -d <id> 5` (freeform) on the phone, which is what One UI 8.5/9
 needs for movable, resizable DeX windows. On One UI 8.5+ it also keeps the "freeform windows"
 developer option off while DeX runs (with it on, window title bars can't be dragged and their

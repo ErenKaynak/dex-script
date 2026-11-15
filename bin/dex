@@ -35,12 +35,13 @@ Commands:
   dex school         start DeX, profile "school" (denser, Word/Excel side by side)
   dex movie          start DeX, profile "movie" (high bitrate, H.265)
   dex mirror         plain phone-screen mirror (no virtual display)
-  dex pair           wireless pairing without a cable
-  dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
+  dex pair           wireless pairing without a cable (once per PC; dex remembers the phone)
+  dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / remembered phone)
   dex wifi           switch a USB-connected phone to Wi-Fi
   dex wake           wake the phone / unfreeze a stuck DeX window
   dex keyboard       open phone keyboard settings (pick Turkish Q)
   dex doctor         show versions, devices and phone info
+  dex debug          start DeX (code) and save a phone log for bug reports
   dex update         re-run the installer (latest scripts)
   dex uninstall      remove everything dex installed
   dex help           this text
@@ -53,6 +54,10 @@ Options (start commands):
   --screen-off       same as --screen off
   --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
   --no-freeform      skip the One UI 8.5+/9 windowing fix
+  --mouse uhid|sdk   uhid (default on Android 15+): real HID mouse on the DeX display,
+                     DeX title bars drag like with a plugged-in mouse (Alt releases the
+                     PC pointer). sdk: injected touch-style clicks, pointer not captured.
+  --debug            save the phone log of this session to the config folder
   --                 pass everything after it to scrcpy
 
 Phone screen: "on" is the safe default (DeX never freezes). "dim" keeps the panel
@@ -61,7 +66,9 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: $CONFIG
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
-  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_LAST_ENDPOINT
+  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_MOUSE (uhid|sdk),
+  DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
+  DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 EOF
 }
 
@@ -108,13 +115,25 @@ count_lines() { printf '%s' "$1" | grep -c . || true; }
 
 connected_ok() { grep -qi "connected to"; }
 
+save_endpoint() { # save_endpoint IP:PORT - remember where the phone was reached over Wi-Fi
+  cfg_set DEX_LAST_ENDPOINT "$1"
+  cfg_set DEX_LAST_IP "${1%:*}"
+}
+# The phone keeps the PC's pairing key, so pairing is needed once per PC. What changes is the
+# connect port (every Wireless debugging restart / phone reboot), so dex remembers the phone and
+# only needs the new port, never the pairing code again.
 mdns_connect() { # try auto-discovered wireless debugging endpoint; 0 on success
-  local ep
-  ep="$("$ADB" mdns services 2>/dev/null | awk '/_adb-tls-connect\._tcp/ {print $NF; exit}' || true)"
+  local list ep serial
+  list="$("$ADB" mdns services 2>/dev/null | awk '/_adb-tls-connect\._tcp/ {print $1, $NF}' || true)"
+  [ -n "$list" ] || return 1
+  serial="$(cfg_get DEX_PHONE_SERIAL)"
+  ep=""
+  if [ -n "$serial" ]; then ep="$(printf '%s\n' "$list" | grep -F -- "$serial" | awk '{print $2; exit}' || true)"; fi
+  [ -n "$ep" ] || ep="$(printf '%s\n' "$list" | awk '{print $2; exit}')"
   [ -n "$ep" ] || return 1
   say "Found phone via mDNS: $ep"
   if "$ADB" connect "$ep" 2>&1 | connected_ok; then
-    cfg_set DEX_LAST_ENDPOINT "$ep"
+    save_endpoint "$ep"
     return 0
   fi
   return 1
@@ -125,6 +144,40 @@ saved_connect() {
   [ -n "$ep" ] || return 1
   say "Trying last endpoint $ep ..."
   "$ADB" connect "$ep" 2>&1 | connected_ok
+}
+remembered_phone() { # prints "Galaxy S25 (last at 192.168.1.5)" or nothing
+  local name ip
+  name="$(cfg_get DEX_PHONE_NAME)"; ip="$(cfg_get DEX_LAST_IP)"
+  [ -n "$name$ip" ] || return 1
+  printf '%s' "${name:-phone}"
+  [ -n "$ip" ] && printf ' (last at %s)' "$ip"
+  return 0
+}
+# Ask only for the new connect port of a remembered phone (interactive terminals only).
+prompt_reconnect() {
+  local ip ep port
+  ip="$(cfg_get DEX_LAST_IP)"
+  [ -n "$ip" ] && [ -t 0 ] && [ "${DEX_NO_TUI:-0}" != 1 ] || return 1
+  say "Remembered phone: $(remembered_phone). The pairing is kept; only the port changes."
+  say "Phone > Developer options > Wireless debugging > \"IP address & Port\" (Enter = skip)"
+  read -r -p "Port or IP:port: " port || true
+  [ -n "$port" ] || return 1
+  case "$port" in *:*) ep="$port" ;; *) ep="$ip:$port" ;; esac
+  if "$ADB" connect "$ep" 2>&1 | connected_ok; then save_endpoint "$ep"; return 0; fi
+  warn "Could not connect to $ep."
+  return 1
+}
+# Remember the connected phone (name + serial) so later sessions find it without pairing again.
+remember_phone() {
+  local name serial
+  serial="$(phone_shell getprop ro.serialno)"
+  [ -n "$serial" ] || return 0
+  [ "$serial" = "$(cfg_get DEX_PHONE_SERIAL)" ] && return 0
+  name="$(phone_shell getprop ro.product.marketname)"
+  [ -n "$name" ] || name="$(phone_shell getprop ro.product.model)"
+  cfg_set DEX_PHONE_SERIAL "$serial"
+  [ -n "$name" ] && cfg_set DEX_PHONE_NAME "$name"
+  return 0
 }
 
 no_device_help() {
@@ -139,10 +192,21 @@ EOF
     return
   fi
   err "No phone found."
+  local rp
+  if rp="$(remembered_phone)"; then
+    cat >&2 <<EOF
+Remembered: $rp. It is already paired with this PC: no code needed.
+  1. Plug in the USB cable, or
+  2. dex connect - type the current port from Wireless debugging ("IP address & Port").
+     (Wireless debugging must be ON and the phone on the same Wi-Fi.)
+  3. dex pair    - only if the phone forgot this PC (Wireless debugging > Paired devices).
+EOF
+    return
+  fi
   cat >&2 <<EOF
 Options:
   1. Plug in the USB cable (and accept "Allow USB debugging" on the phone).
-  2. dex pair   - pair wirelessly (Wireless debugging), no cable needed.
+  2. dex pair   - pair wirelessly (Wireless debugging), no cable needed. Once per PC.
   3. dex wifi   - with the cable plugged in, switch the connection to Wi-Fi.
 EOF
 }
@@ -165,7 +229,7 @@ select_device() {
     no_device_help; return 2
   fi
   if [ -z "$TCP_LIST" ]; then
-    if mdns_connect || saved_connect; then scan_devices; fi
+    if mdns_connect || saved_connect || prompt_reconnect; then scan_devices; fi
   fi
   if [ -n "$TCP_LIST" ]; then
     SERIAL="$(first_line "$TCP_LIST")"; TRANSPORT=wifi
@@ -259,7 +323,48 @@ freeform_support_off() {
   SAVED_FREEFORM_SUPPORT=""
 }
 
-restore_phone() { dim_off; freeform_support_off; }
+# Opt-in (config DEX_FORCE_DESKTOP=1): the AOSP "force desktop mode on external displays"
+# developer setting, set for the session and restored on exit. Makes Android treat the virtual
+# display like an external monitor (full desktop mode) on builds where the windowing-mode fix
+# alone leaves inert title bars. Not on by default: on One UI 9 the external-display path is
+# where sam1am/localdex saw SystemUI crash on title bar drags.
+SAVED_FORCE_DESKTOP=""
+force_desktop_on() {
+  [ "$(cfg_get DEX_FORCE_DESKTOP)" = 1 ] || return 0
+  local cur
+  cur="$(phone_shell settings get global force_desktop_mode_on_external_displays)"
+  case "$cur" in 1|"") return 0 ;; esac
+  SAVED_FORCE_DESKTOP="$cur"
+  phone_shell settings put global force_desktop_mode_on_external_displays 1 >/dev/null
+  say "${C_DIM}force_desktop_mode_on_external_displays=1 while DeX runs (DEX_FORCE_DESKTOP).${C_OFF}"
+}
+force_desktop_off() {
+  case "$SAVED_FORCE_DESKTOP" in
+    "") ;;
+    null) phone_shell settings delete global force_desktop_mode_on_external_displays >/dev/null ;;
+    *) phone_shell settings put global force_desktop_mode_on_external_displays "$SAVED_FORCE_DESKTOP" >/dev/null ;;
+  esac
+  SAVED_FORCE_DESKTOP=""
+}
+
+# Mouse mode. "uhid" = scrcpy creates a real HID mouse on the phone and binds it to the DeX
+# display (Android 15+): DeX gets the same events as a mouse plugged into a DeX dock, so title bar
+# drags, window buttons and edge resizing behave like native DeX. "sdk" injects clicks through the
+# Android API; left clicks arrive as *touchscreen* finger events, which One UI 8.5+'s window
+# decorations handle as touch (tap-and-hold to move) and partly ignore.
+want_mouse() { # prints uhid|sdk: --mouse, config DEX_MOUSE, else uhid on Android 15+
+  local v sdk
+  v="${OPT_MOUSE:-$(cfg_get DEX_MOUSE)}"
+  case "$v" in uhid|sdk) echo "$v"; return ;; esac
+  sdk="$(phone_shell getprop ro.build.version.sdk)"
+  case "$sdk" in [0-9]*) [ "$sdk" -ge 35 ] && { echo uhid; return; } ;; esac
+  echo sdk
+}
+mod_name() { # human name of the shortcut mod
+  case "$1" in lsuper|rsuper) echo "Cmd" ;; lctrl|rctrl) echo "Ctrl" ;; *) echo "Alt" ;; esac
+}
+
+restore_phone() { dim_off; freeform_support_off; force_desktop_off; }
 
 # --- screen size --------------------------------------------------------------------
 detect_screen() { # prints "WxH" or nothing
@@ -309,11 +414,42 @@ run_scrcpy() {
     while IFS= read -r line; do
       printf '%s\n' "$line"
       case "$line" in
-        *"New display:"*"(id="*) id="${line##*(id=}"; enable_freeform "${id%%)*}" ;;
+        *"New display:"*"(id="*)
+          id="${line##*(id=}"; id="${id%%)*}"
+          enable_freeform "$id"
+          if [ -n "${DEBUG_LOG:-}" ]; then
+            { printf '\n==== dumpsys window displays (display %s, after the freeform fix) ====\n' "$id"
+              phone_shell dumpsys window displays; } >> "$DEBUG_LOG.dumpsys" 2>/dev/null
+          fi ;;
       esac
     done
   )
   return "${PIPESTATUS[0]}"
+}
+
+# Bug-report log: phone logcat for the whole session + window manager dumps. Open an app, try to
+# drag its title bar and press its buttons, then close DeX and send the files.
+DEBUG_LOG=""; LOGCAT_PID=""
+debug_start() {
+  mkdir -p "$CONFIG_DIR"
+  DEBUG_LOG="$CONFIG_DIR/debug-$(date +%Y%m%d-%H%M%S).log"
+  { say "dex debug $(date)"; say "scrcpy: $*"; say "phone: $(phone_shell getprop ro.product.model) One UI $(phone_shell getprop ro.build.version.oneui) SDK $(phone_shell getprop ro.build.version.sdk)"
+    say "settings: freeform_support=$(phone_shell settings get global enable_freeform_support) force_desktop=$(phone_shell settings get global force_desktop_mode_on_external_displays)"
+  } > "$DEBUG_LOG"
+  "$ADB" -s "$SERIAL" logcat -c >/dev/null 2>&1 || true
+  "$ADB" -s "$SERIAL" logcat -v threadtime '*:D' >> "$DEBUG_LOG" 2>&1 &
+  LOGCAT_PID=$!
+  say "${C_WARN}Debug log: $DEBUG_LOG (open an app, drag its title bar, press its buttons, then close DeX)${C_OFF}"
+}
+debug_stop() {
+  [ -n "$DEBUG_LOG" ] || return 0
+  { printf '\n==== dumpsys window windows (at exit) ====\n'; phone_shell dumpsys window windows
+    printf '\n==== dumpsys activity activities (at exit) ====\n'; phone_shell dumpsys activity activities
+  } >> "$DEBUG_LOG.dumpsys" 2>/dev/null
+  if [ -n "$LOGCAT_PID" ]; then kill "$LOGCAT_PID" 2>/dev/null; wait "$LOGCAT_PID" 2>/dev/null; fi
+  grep -i -E 'ShellDesktopMode|DesktopMode|wmshell|FATAL|AndroidRuntime|DexCaption|Caption' "$DEBUG_LOG" > "$DEBUG_LOG.filtered" 2>/dev/null || true
+  ok "Debug log saved: $DEBUG_LOG (+ .dumpsys, .filtered). Send these files with your bug report."
+  DEBUG_LOG=""; LOGCAT_PID=""
 }
 
 # --- start -------------------------------------------------------------------------
@@ -326,7 +462,7 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
     cfg_set DEX_KEYBOARD_HINT_SHOWN 1
   fi
 
-  local dpi bitrate res codec="h264" mod screen fullscreen
+  local dpi bitrate res codec="h264" mod screen fullscreen mouse
   local extra_profile=()
   case "$profile" in
     code) bitrate=16 ;;
@@ -358,10 +494,12 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   [ "$FREEFORM" = 0 ] || FREEFORM=1
   [ "$profile" != "mirror" ] || FREEFORM=0 # no virtual display to fix
 
+  mouse="$(want_mouse)"
+
   local args=(-s "$SERIAL")
   if [ "$profile" != "mirror" ]; then
     args+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content
-      --keyboard=uhid --mouse=sdk --mouse-bind=++++:bhsn)
+      --keyboard=uhid "--mouse=$mouse" --mouse-bind=++++:bhsn)
   fi
   args+=("--window-title=Galaxy DeX ($profile)" "--shortcut-mod=$mod")
   # --keep-active: simulated user activity keeps the phone from sleeping on USB *and* Wi-Fi
@@ -393,16 +531,23 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   fi
 
   cfg_set DEX_LAST_PROFILE "$profile"
+  remember_phone
   wake_phone
-  if [ "$FREEFORM" = 1 ]; then freeform_support_set "$(want_freeform_support)"; fi
+  if [ "$FREEFORM" = 1 ]; then freeform_support_set "$(want_freeform_support)"; force_desktop_on; fi
   if [ "$screen" = dim ]; then dim_on; fi
-  trap 'restore_phone' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
-  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen)..."
-  say "${C_DIM}Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake${C_OFF}"
+  if [ "${OPT_DEBUG:-0}" = 1 ]; then debug_start "${args[@]}"; fi
+  trap 'restore_phone; debug_stop' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
+  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen, mouse: $mouse)..."
+  local modn; modn="$(mod_name "$mod")"
+  say "${C_DIM}Resize the window freely. F11 = fullscreen, $modn+q quits. Frozen? Run: dex wake${C_OFF}"
+  if [ "$profile" != "mirror" ] && [ "$mouse" = uhid ]; then
+    say "${C_DIM}The DeX window captures the mouse (real HID mouse on the phone). Press $modn to give it back to the PC, click the window to capture again.${C_OFF}"
+  fi
   local rc
   run_scrcpy "${args[@]}"; rc=$?
   trap - INT TERM
   restore_phone
+  debug_stop
   case "$rc" in
     0) ok "DeX closed. Your apps moved back to the phone." ;;
     2) warn "The phone disconnected (cable unplugged, Wi-Fi dropped or the phone slept)." ;;
@@ -421,10 +566,25 @@ Could not pair/connect. Check:
 EOF
 }
 
+# after_wifi_connect [IP:PORT]: note the phone just connected so later sessions skip pairing.
+# adb names a TCP device by its endpoint, so the endpoint is the serial to talk to.
+after_wifi_connect() {
+  local ep="${1:-$(cfg_get DEX_LAST_ENDPOINT)}"
+  [ -n "$ep" ] || return 0
+  SERIAL="$ep"; remember_phone
+}
+
 cmd_pair() {
   need_tools
+  local rp
+  if rp="$(remembered_phone)"; then
+    say "Remembered phone: $rp. Pairing is only needed once per PC; checking if it is reachable..."
+    if mdns_connect || saved_connect; then ok "Already paired and connected. Run: dex"; return 0; fi
+    say "Not reachable. If Wireless debugging is on and only the port changed, use: dex connect"
+    say "Continue to pair again (needed if the phone forgot this PC, e.g. after a PC reset)."
+  fi
   cat <<EOF
-Pair without a cable:
+Pair without a cable (once per PC):
   Phone > Settings > Developer options > Wireless debugging ON
   > "Pair device with pairing code".
 EOF
@@ -440,28 +600,39 @@ EOF
     read -r -p "Connect IP:port: " ep || true
     if [ -z "$ep" ]; then err "Need the connect IP:port."; return 1; fi
     if "$ADB" connect "$ep" 2>&1 | connected_ok; then
-      cfg_set DEX_LAST_ENDPOINT "$ep"
+      save_endpoint "$ep"
     else
       pair_hints; return 1
     fi
   fi
-  ok "Connected. Run: dex"
+  after_wifi_connect "$(cfg_get DEX_LAST_ENDPOINT)"
+  ok "Connected and remembered. Next time: just run dex (or press c if the port changed). Run: dex"
 }
 
 cmd_connect() {
   need_tools
-  local ep="${1:-}"
+  local ep="${1:-}" ip
   if [ -z "$ep" ]; then
-    if mdns_connect; then ok "Connected."; return 0; fi
-    ep="$(cfg_get DEX_LAST_ENDPOINT)"
-    if [ -z "$ep" ]; then
+    if mdns_connect; then after_wifi_connect "$(cfg_get DEX_LAST_ENDPOINT)"; ok "Connected."; return 0; fi
+    if saved_connect; then after_wifi_connect "$(cfg_get DEX_LAST_ENDPOINT)"; ok "Connected to $(cfg_get DEX_LAST_ENDPOINT)."; return 0; fi
+    ip="$(cfg_get DEX_LAST_IP)"
+    if [ -n "$ip" ]; then
+      say "Remembered phone: $(remembered_phone). No pairing code needed, only the current port."
+      read -r -p "Port or IP:port (Wireless debugging > \"IP address & Port\"): " ep || true
+    else
       read -r -p "Phone IP:port (Wireless debugging screen): " ep || true
     fi
   fi
   if [ -z "$ep" ]; then err "No endpoint given. Try: dex pair"; return 1; fi
-  case "$ep" in *:*) ;; *) ep="$ep:5555" ;; esac
+  ip="$(cfg_get DEX_LAST_IP)"
+  case "$ep" in
+    *:*) ;;
+    *[!0-9]*) ep="$ep:5555" ;;      # an IP without a port: the dex wifi port
+    *) if [ -n "$ip" ]; then ep="$ip:$ep"; else err "Only a port given but no remembered phone. Use IP:port."; return 1; fi ;;
+  esac
   if "$ADB" connect "$ep" 2>&1 | connected_ok; then
-    cfg_set DEX_LAST_ENDPOINT "$ep"
+    save_endpoint "$ep"
+    after_wifi_connect "$ep"
     ok "Connected to $ep. Run: dex"
   else
     pair_hints; return 1
@@ -482,7 +653,8 @@ cmd_wifi() {
   ip="$("$ADB" -s "$s" shell ip -f inet addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -n 1)"
   if [ -z "$ip" ]; then err "Could not read the phone's Wi-Fi IP. Is Wi-Fi on?"; return 1; fi
   if "$ADB" connect "$ip:5555" 2>&1 | connected_ok; then
-    cfg_set DEX_LAST_ENDPOINT "$ip:5555"
+    save_endpoint "$ip:5555"
+    after_wifi_connect "$ip:5555"
     ok "Connected over Wi-Fi ($ip:5555). You can unplug the cable (works until the phone reboots)."
   else
     pair_hints; return 1
@@ -550,6 +722,10 @@ cmd_doctor() {
   local ffs
   ffs="$(phone_shell settings get global enable_freeform_support)"
   say "freeform support: $ffs (dex sets it to $(want_freeform_support) while DeX runs)"
+  say "force desktop:    $(phone_shell settings get global force_desktop_mode_on_external_displays) (DEX_FORCE_DESKTOP=$(cfg_get DEX_FORCE_DESKTOP))"
+  say "mouse mode:       $(want_mouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
+  local rp
+  if rp="$(remembered_phone)"; then say "remembered: $rp"; fi
   return 0
 }
 
@@ -624,6 +800,8 @@ row_kv() { # row_kv LABEL VALUE [COLOR] [RIGHT]
 TUI_MODEL=""; TUI_SERIAL_SEEN=""; TUI_MSG=""; TUI_MSG_C=""
 tui_phone_status() { # sets TUI_PHONE (status text), TUI_PHONE_C (color), TUI_BATT
   TUI_PHONE="no phone: plug in USB, or p = pair"; TUI_PHONE_C="$C_ERR"; TUI_BATT=""
+  local rp
+  if rp="$(remembered_phone)"; then TUI_PHONE="not connected: $rp $DOT c = connect"; fi
   scan_devices
   local s="" transport="" ui="" lvl=""
   if [ -n "$USB_LIST" ]; then s="$(first_line "$USB_LIST")"; transport="USB"
@@ -646,9 +824,10 @@ tui_phone_status() { # sets TUI_PHONE (status text), TUI_PHONE_C (color), TUI_BA
 }
 
 tui_frame() { # prints one full frame
-  local ver screen fullscreen res dpi last cols line
+  local ver screen fullscreen res dpi last cols line mouse
   ver="$("$SCRCPY" --version 2>/dev/null | head -n 1 | awk '{print $2}')"
   screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
+  mouse="$(cfg_get DEX_MOUSE)"; [ -n "$mouse" ] || mouse="auto"
   if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then fullscreen="fullscreen"; else fullscreen="window"; fi
   res="$(cfg_get DEX_RES)"; [ -n "$res" ] || res="$(default_res 80) auto"
   dpi="$(cfg_get DEX_DPI)"; [ -n "$dpi" ] || dpi="auto"
@@ -664,7 +843,7 @@ tui_frame() { # prints one full frame
   printf '  %s%s%s %s%s%s%s%s%s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_B" "$(pad "Galaxy DeX on your PC" $((BOX_W-2-${#ver}-7)))" "$C_OFF" "$C_DIM" "scrcpy $ver" "$C_OFF" "$C_CYAN" "$V" "$C_OFF"
   hline "$ML" "$MR"
   row_kv "Phone" "$TUI_PHONE" "$TUI_PHONE_C" "$TUI_BATT"
-  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT $res @ $dpi"
+  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT mouse $mouse $DOT $res @ $dpi"
   hline "$ML" "$MR"
   local m1="" m2="" m3="" m4=""
   case "$last" in code) m1="last " ;; school) m2="last " ;; movie) m3="last " ;; mirror) m4="last " ;; esac
@@ -680,8 +859,10 @@ tui_frame() { # prints one full frame
   row_item s "Screen" "phone panel while DeX runs: on / dim / off"
   row_item f "Window" "toggle window / fullscreen start"
   row_item r "Size" "set window size and DPI"
+  row_item m "Mouse" "real HID mouse (uhid) / injected touch (sdk)"
   row_item d "Doctor" "versions, devices, One UI check"
   row_item x "Wake" "unfreeze a stuck DeX window"
+  row_item l "Log" "start Code with a phone log for bug reports"
   row_item u "Update" "re-run the installer"
   row_item q "Quit" ""
   hline "$BL" "$BR"
@@ -733,6 +914,12 @@ tui_menu() {
       k|K) tui_run cmd_keyboard ;;
       d|D) tui_run cmd_doctor ;;
       x|X) tui_run cmd_wake ;;
+      l|L) OPT_DEBUG=1; tui_run start code; OPT_DEBUG=0 ;;
+      m|M)
+        case "$(cfg_get DEX_MOUSE)" in
+          sdk) cfg_set DEX_MOUSE uhid; tui_msg "Mouse: real HID mouse on the DeX display (title bars drag like native DeX; Alt releases the pointer)." "$C_OK" ;;
+          *) cfg_set DEX_MOUSE sdk; tui_msg "Mouse: injected touch-style clicks (pointer never captured; window title bars may not drag on One UI 8.5+)." "$C_WARN" ;;
+        esac ;;
       u|U) cmd_update; return $? ;;
       h|H|'?') tui_run usage ;;
       s|S)
@@ -758,7 +945,7 @@ tui_menu() {
 }
 
 # --- main -------------------------------------------------------------------------------
-MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_RAW=()
+MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_MOUSE=""; OPT_DEBUG=0; OPT_RAW=()
 CMD=""
 if [ $# -gt 0 ]; then
   case "$1" in -*) ;; *) CMD="$1"; shift ;; esac
@@ -777,6 +964,9 @@ while [ $# -gt 0 ]; do
     --screen-off) OPT_SCREEN=off; shift ;;
     --fullscreen) OPT_FULLSCREEN=1; shift ;;
     --no-freeform) OPT_FREEFORM=0; shift ;;
+    --mouse) [ $# -ge 2 ] || die "--mouse needs uhid or sdk"; OPT_MOUSE="$2"; shift 2 ;;
+    --mouse=*) OPT_MOUSE="${1#*=}"; shift ;;
+    --debug) OPT_DEBUG=1; shift ;;
     --menu|--tui) CMD=menu; shift ;;
     -h|--help) CMD=help; shift ;;
     --) shift; OPT_RAW=("$@"); break ;;
@@ -787,6 +977,7 @@ done
 case "$OPT_RES" in ""|[0-9]*x[0-9]*) ;; *) die "--res must look like 1600x900" ;; esac
 case "$OPT_DPI" in ""|[0-9]*) ;; *) die "--dpi must be a number" ;; esac
 case "$OPT_SCREEN" in ""|on|dim|off) ;; *) die "--screen must be on, dim or off" ;; esac
+case "$OPT_MOUSE" in ""|uhid|sdk) ;; *) die "--mouse must be uhid or sdk" ;; esac
 
 if [ -z "$CMD" ]; then
   # No command: interactive menu on a terminal, otherwise the default profile (scripts, CI).
@@ -796,6 +987,7 @@ fi
 case "$CMD" in
   menu) tui_menu ;;
   code|school|movie|mirror) start "$CMD" ;;
+  debug) OPT_DEBUG=1; start code ;;
   pair) cmd_pair ;;
   connect) cmd_connect "${POS[0]:-}" ;;
   wifi) cmd_wifi ;;

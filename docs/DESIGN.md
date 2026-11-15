@@ -68,15 +68,16 @@ Commands
 | `dex wifi` | USB plugged → `adb tcpip 5555`, read phone Wi-Fi IP (`adb shell ip -f inet addr show wlan0`), connect, save endpoint; tell user to unplug (survives until phone reboot) |
 | `dex wake` | `adb shell input -d 0 keyevent KEYCODE_WAKEUP` (+ plain `KEYCODE_WAKEUP`); recovers a frozen DeX window after the phone dozed |
 | `dex keyboard` | open phone's Physical keyboard settings (`adb shell am start -a android.settings.HARD_KEYBOARD_SETTINGS`) and tell user to pick **Turkish Q** |
-| `dex doctor` | versions (scrcpy/adb), `adb devices -l`, phone model, Android SDK (`getprop ro.build.version.sdk`), One UI (`getprop ro.build.version.oneui`, e.g. 90000 → 9.0), warn if One UI < 8 (DeX on virtual display needs 8+) |
+| `dex doctor` | versions (scrcpy/adb), `adb devices -l`, phone model, Android SDK (`getprop ro.build.version.sdk`), One UI (`getprop ro.build.version.oneui`, e.g. 90000 → 9.0), warn if One UI < 8 (DeX on virtual display needs 8+), mouse mode, force-desktop setting, remembered phone |
+| `dex debug` | `dex code --debug`: phone logcat (`logcat -v threadtime *:D`) for the whole session into `<config dir>/debug-<timestamp>.log`, `dumpsys window displays` after the freeform fix and `dumpsys window windows` + `dumpsys activity activities` at exit into `.dumpsys`, and a `.filtered` file (`ShellDesktopMode|DesktopMode|wmshell|FATAL|AndroidRuntime|DexCaption|Caption`) for bug reports about window decorations |
 | `dex update` | re-run the installer from the raw URL (same one-liner) |
 | `dex uninstall` | remove root dir, CLI, launchers, PATH lines; keep nothing |
 | `dex help` / `-h` | usage |
 
 Options (any start command): `--res WxH` (initial size; default = 80% of primary screen if
 detectable, else 1600x900; with `--fullscreen` 100% / 1920x1080), `--dpi N`, `--usb`, `--wifi`,
-`--screen on|dim|off` (`--screen-off` = off), `--fullscreen`, `--no-freeform`, `--` then extra raw
-scrcpy args.
+`--screen on|dim|off` (`--screen-off` = off), `--fullscreen`, `--no-freeform`, `--mouse uhid|sdk`,
+`--debug`, `--` then extra raw scrcpy args.
 
 ### Interactive menu (TUI)
 
@@ -88,7 +89,10 @@ selection, loops until `q`:
   line (`phone on|dim|off`, `window|fullscreen`, `res @ dpi`).
 - `Enter`/`1` Code, `2` School, `3` Movie, `4` Mirror, `p` Pair, `c` Connect, `w` Wi-Fi, `k`
   Keyboard, `s` cycle `DEX_SCREEN` on → dim → off, `f` toggle `DEX_FULLSCREEN`, `r` prompt
-  `DEX_RES` / `DEX_DPI`, `d` Doctor, `x` Wake, `u` Update, `h` help, `q`/Esc quit.
+  `DEX_RES` / `DEX_DPI`, `m` toggle `DEX_MOUSE` uhid ↔ sdk, `d` Doctor, `x` Wake, `l` Log (`dex
+  debug`), `u` Update, `h` help, `q`/Esc quit.
+- Phone line when nothing is connected but a phone is remembered: `not connected: <name> (last at
+  <ip>) · c = connect`.
 - After an action: "Press any key to return to the menu". Errors (no device etc.) are shown in
   the menu instead of exiting.
 
@@ -106,6 +110,11 @@ selection, loops until `q`:
    freeform windows whose title bar could not be dragged and whose close/minimize/maximize
    buttons did nothing; sam1am/localdex reports draggable windows on One UI 9 with the same
    server and windowing-mode fix and the option untouched. Not yet verified on device.
+   Opt-in config `DEX_FORCE_DESKTOP=1`: additionally set global
+   `force_desktop_mode_on_external_displays` to 1 for the session (restored after, `null` →
+   delete). AOSP then treats the virtual display like an external monitor (full desktop mode);
+   off by default because on One UI 9 the external-display path is where localdex saw SystemUI
+   crash on title bar drags. A lever for field tests, not a default.
 4. **Screen mode**: `dim` → save `screen_brightness` + `screen_brightness_mode`, set mode 0 and
    brightness 0, restore after exit (also on Ctrl+C). `off` → scrcpy `--turn-screen-off`.
 5. Run scrcpy with stdout+stderr streamed to the console and watched line by line. On
@@ -123,11 +132,26 @@ selection, loops until `q`:
 
 1. `--usb` or a USB device present in `adb devices` (serial without `:`) → use `-s <serial>`.
 2. Else `--wifi`/no USB: if an already-connected TCP device exists → use it. Else try `adb mdns
-   services` for `_adb-tls-connect._tcp` → `adb connect`; else last saved endpoint
-   (`DEX_LAST_ENDPOINT` in config) → `adb connect`.
-3. Still nothing → explain three options: plug USB cable, `dex pair`, `dex wifi`.
+   services` for `_adb-tls-connect._tcp` (prefer the instance whose name contains the remembered
+   `DEX_PHONE_SERIAL`, the instance name is `adb-<serial>-<random>`) → `adb connect`; else last
+   saved endpoint (`DEX_LAST_ENDPOINT` in config) → `adb connect`; else, if `DEX_LAST_IP` is set
+   and stdin is a TTY, prompt for the new port only (`<port>` → `DEX_LAST_IP:<port>`, Enter skips).
+3. Still nothing → explain three options: plug USB cable, `dex connect` (remembered phone: no
+   pairing code needed) / `dex pair`, `dex wifi`.
 4. Several devices → pick the first USB one, else first TCP one, and say which.
    Device in state `unauthorized` → tell user to accept the "Allow USB debugging" prompt on phone.
+
+### Remembered phone (pair once per PC)
+
+Wireless debugging pairing stores the PC's adb key on the phone (`~/.android/adbkey`, Windows
+`%USERPROFILE%\.android`), so pairing is needed once per PC; only the connect port changes (new
+random port whenever Wireless debugging restarts or the phone reboots). After every successful
+connection `dex` saves `DEX_PHONE_SERIAL` (`getprop ro.serialno`), `DEX_PHONE_NAME`
+(`ro.product.marketname`, else `ro.product.model`), `DEX_LAST_ENDPOINT` and `DEX_LAST_IP`. `dex
+pair` on a remembered phone first tries mDNS / the last endpoint ("Already paired and connected");
+`dex connect` with no argument tries mDNS, the last endpoint, then asks for the port only; `dex
+connect <port>` uses the remembered IP, `dex connect <ip>` uses port 5555 (the `dex wifi` port).
+School PCs that are wiped on reboot lose the key, so there pairing is per session.
 
 ### `dex pair` flow (school PCs: run every boot, no cable)
 
@@ -145,7 +169,7 @@ Common to all DeX profiles (never restrict resizing or multitasking):
 
 ```
 --new-display=<W>x<H>/<DPI>  --flex-display  --no-vd-destroy-content
---keyboard=uhid  --mouse=sdk  --mouse-bind=++++:bhsn
+--keyboard=uhid  --mouse=<uhid|sdk>  --mouse-bind=++++:bhsn
 --window-title="Galaxy DeX (<profile>)"  --shortcut-mod=<mod>
 --keep-active  --disable-screensaver  --max-fps=60  --video-bit-rate=<N>M
 --stay-awake (USB only)  --video-buffer=50 (Wi-Fi only)  --video-codec=<codec>
@@ -161,6 +185,18 @@ Common to all DeX profiles (never restrict resizing or multitasking):
   "dark phone" alternative (brightness 0, restored afterwards).
 
 - `--no-vd-destroy-content`: closing the window moves apps to the phone instead of killing them.
+- `--mouse=uhid` (default when `ro.build.version.sdk` ≥ 35, config `DEX_MOUSE` / `--mouse`
+  override, `sdk` below Android 15): scrcpy creates a HID mouse through UHID and associates it
+  with the virtual display (scrcpy ≥ 3.3, `InputManager.addUniqueIdAssociationByPort`, Android
+  15+), so DeX receives `SOURCE_MOUSE` events from a real input device, exactly like a mouse in a
+  DeX dock, and draws its own pointer. With `--mouse=sdk` scrcpy injects events through the
+  Android API: hover and secondary buttons are mouse events, but a **left click/drag is injected
+  as a touchscreen finger** (`Controller.injectTouch`: `TOOL_TYPE_FINGER` / `SOURCE_TOUCHSCREEN`
+  unless hover or a secondary button). One UI 8.5+ window decorations handle touch differently
+  (tap-and-hold to move, WM Shell's `DragResizeInputListener` claims and discards the down event,
+  see dotnetdreamer/open-android-dex#4), which matches the field test where title bars could not
+  be dragged and their buttons did nothing. Cost of uhid: the PC pointer is captured while the
+  window has focus (shortcut mod releases it, a click re-captures). Not yet verified on device.
 - `--mouse-bind=++++:bhsn`: right/middle click reach DeX (context menus in Office) instead of BACK/HOME.
 - `--keyboard=uhid`: physical keyboard, layout chosen on phone (Turkish Q) → `dex keyboard`.
 - shortcut mod default: macOS `lsuper` (Cmd), Linux/Windows `lalt`. Never `ralt` (Turkish Q AltGr
@@ -181,9 +217,12 @@ files, Plex/Jellyfin work fine here."
 
 Over Wi-Fi lower defaults: bit-rate × 0.5 (code 8M, school 6M, movie 12M), keep 60 fps.
 
-Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_SHORTCUT_MOD`, `DEX_DPI`,
-`DEX_RES`, `DEX_EXTRA_ARGS`, `DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM`
-(0|1), `DEX_FREEFORM_SUPPORT` (0|1, unset = by One UI version), `DEX_KEYBOARD_HINT_SHOWN`. Write config safely (replace key line or append).
+Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_LAST_IP`,
+`DEX_PHONE_SERIAL`, `DEX_PHONE_NAME`, `DEX_SHORTCUT_MOD`, `DEX_DPI`, `DEX_RES`, `DEX_EXTRA_ARGS`,
+`DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM` (0|1), `DEX_FREEFORM_SUPPORT`
+(0|1, unset = by One UI version), `DEX_MOUSE` (uhid|sdk, unset = by Android version),
+`DEX_FORCE_DESKTOP` (0|1), `DEX_LAST_PROFILE`, `DEX_KEYBOARD_HINT_SHOWN`. Write config safely
+(replace key line or append).
 
 Screen size detection: Linux `xrandr --current` (primary or first connected) or
 `xdpyinfo`; Wayland fallback 1600x900. macOS: `system_profiler SPDisplaysDataType` ("Resolution:"
@@ -197,7 +236,8 @@ Default window res = 80% of that, rounded down to multiples of 8.
   `DEX_DRY_RUN=1` (print the scrcpy command, exit 0), `DEX_NO_TUI=1`.
 - `tests/fake-phone.sh`: stub adb/scrcpy pair (Galaxy on One UI 9, dozing) that checks the whole
   start flow without hardware (wake, freeform fix on "New display", dim/restore, argument list,
-  exit 2 without device). Runs in CI.
+  mouse mode by Android version, force-desktop opt-in, debug log, remembered phone + mDNS
+  preference + `connect <port>`, exit 2 without device). Runs in CI.
 - First run: if config has no `DEX_KEYBOARD_HINT_SHOWN`, print Turkish Q hint once and set it.
 - Exit codes: 0 ok, 1 usage/runtime error, 2 no device.
 - Bash: `set -euo pipefail`, POSIX-ish bash 3.2 compatible (macOS ships bash 3.2: no associative
