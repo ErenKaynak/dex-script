@@ -15,7 +15,8 @@ if (Test-Path $script:configFile) {
 # Script state (phone selection, saved phone settings, menu state).
 $script:serial = ''; $script:transport = ''; $script:usbList = @(); $script:tcpList = @(); $script:unauth = @()
 $script:savedFf = ''; $script:savedBri = ''; $script:savedBriMode = ''; $script:lastConnectMsg = ''
-$script:tuiSeen = ''; $script:tuiModel = ''; $script:tuiMsg = @('', 'Gray'); $script:scrcpyVer = ''
+$script:tuiSeen = ''; $script:tuiModel = ''; $script:tuiMsg = @('', 'DarkGray'); $script:scrcpyVer = ''
+$script:menuBottom = 0; $script:col = 0; $script:frameW = 80
 $script:adbExit = 0
 $script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Raw = @() }
 # Box drawing and marks need a UTF-8 console; fall back to ASCII otherwise.
@@ -23,13 +24,23 @@ $utf8 = $false
 try { $utf8 = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { Write-Verbose 'No console encoding.' }
 if ($utf8) {
     $script:bx = @{ TL = [string][char]0x256D; TR = [string][char]0x256E; BL = [string][char]0x2570; BR = [string][char]0x256F
-        H = [string][char]0x2500; V = [string][char]0x2502; ML = [string][char]0x251C; MR = [string][char]0x2524; Arrow = [string][char]0x203A }
+        H = [string][char]0x2500; V = [string][char]0x2502; ML = [string][char]0x251C; MR = [string][char]0x2524; Arrow = [string][char]0x203A; Dot = [string][char]0x00B7 }
     $script:okMark = [string][char]0x2713; $script:errMark = [string][char]0x2717
 } else {
-    $script:bx = @{ TL = '+'; TR = '+'; BL = '+'; BR = '+'; H = '-'; V = '|'; ML = '+'; MR = '+'; Arrow = '>' }
+    $script:bx = @{ TL = '+'; TR = '+'; BL = '+'; BR = '+'; H = '-'; V = '|'; ML = '+'; MR = '+'; Arrow = '>'; Dot = '-' }
     $script:okMark = 'OK'; $script:errMark = 'x'
 }
+# Windows Terminal and modern console hosts support ANSI bold; legacy hosts retain colors.
+$script:vtBold = $false
+try { $script:vtBold = [bool]$Host.UI.SupportsVirtualTerminal } catch { Write-Verbose 'No terminal styling support.' }
 $script:boxW = 58
+$script:banner = @'
+           _                   _
+  ___ _ __| | ____ _        __| | _____  __
+ / _ \ '__| |/ / _` |_____ / _` |/ _ \ \/ /
+|  __/ |  |   < (_| |_____| (_| |  __/>  <
+ \___|_|  |_|\_\__,_|      \__,_|\___/_/\_\
+'@
 function Write-Ok([string]$Message) { Write-Host "$($script:okMark) $Message" -ForegroundColor Green }
 function Write-Warn([string]$Message) { Write-Host "! $Message" -ForegroundColor Yellow }
 function Write-Err([string]$Message) { Write-Host "$($script:errMark) $Message" -ForegroundColor Red }
@@ -360,6 +371,7 @@ function Invoke-DexStart([string]$Kind) {
     $scrcpyArgs += @($script:opt.Raw)
     if ($env:DEX_DRY_RUN -eq '1') { Write-Host ('scrcpy ' + ($scrcpyArgs -join ' ')); return 0 }
 
+    Save-ConfigValue 'DEX_LAST_PROFILE' $Kind
     Invoke-WakePhone
     try {
         if ($watch) { Invoke-FreeformSupportOn }
@@ -520,69 +532,137 @@ function Test-Interactive {
     if (![Environment]::UserInteractive) { return $false }
     try { return (!([Console]::IsInputRedirected) -and !([Console]::IsOutputRedirected)) } catch { return $false }
 }
-function Clear-Screen { try { Clear-Host } catch { Write-Verbose 'Cannot clear the screen.' } }
+function Clear-Screen {
+    $script:menuBottom = 0
+    try { Clear-Host } catch { Write-Verbose 'Cannot clear the screen.' }
+}
+function Get-ConsoleSize {
+    $size = @{ Width = 80 }
+    try {
+        if ([Console]::WindowWidth -gt 0) { $size.Width = [Console]::WindowWidth }
+    } catch { Write-Verbose 'No console size.' }
+    return $size
+}
+# Menu lines are written in colored pieces; Write-EndLine pads the rest of the line with spaces
+# (instead of clearing the screen) so each redraw overwrites the previous frame without flicker.
+function Write-Seg([string]$Text, [string]$Color = '', [switch]$Bold) {
+    $display = $Text
+    if ($Bold -and $script:vtBold) { $display = ([string][char]27) + '[1m' + $Text + ([string][char]27) + '[22m' }
+    if ($Color) { Write-Host $display -NoNewline -ForegroundColor $Color } else { Write-Host $display -NoNewline }
+    $script:col += $Text.Length
+}
+function Write-EndLine {
+    $fill = $script:frameW - 1 - ($script:col % $script:frameW)
+    if ($fill -gt 0) { Write-Host (' ' * $fill) -NoNewline }
+    Write-Host ''
+    $script:col = 0
+}
+function Format-Cell([string]$Text, [int]$Width) {
+    if ($Width -lt 0) { $Width = 0 }
+    return $Text.PadRight($Width)
+}
 function Write-BoxLine([string]$Left, [string]$Right) {
-    Write-Host ('  ' + $Left + ($script:bx.H * $script:boxW) + $Right) -ForegroundColor Cyan
+    Write-Seg ('  ' + $Left + ($script:bx.H * $script:boxW) + $Right) 'Cyan'
+    Write-EndLine
 }
 function Write-BoxRow([string]$Text, [string]$Color = '') {
-    $width = $script:boxW - 2
-    if ($Text.Length -gt $width) { $Text = $Text.Substring(0, $width) }
-    $style = @{}
-    if ($Color) { $style.ForegroundColor = $Color }
-    Write-Host ('  ' + $script:bx.V) -NoNewline -ForegroundColor Cyan
-    Write-Host (' ' + $Text.PadRight($width) + ' ') -NoNewline @style
-    Write-Host $script:bx.V -ForegroundColor Cyan
+    Write-Seg ('  ' + $script:bx.V) 'Cyan'
+    Write-Seg (' ' + (Format-Cell $Text ($script:boxW - 2)) + ' ') $Color
+    Write-Seg $script:bx.V 'Cyan'
+    Write-EndLine
 }
-function Write-BoxItem([string]$Key, [string]$Label, [string]$Desc) {
-    Write-BoxRow (' {0,-2} {1,-9} {2}' -f $Key, $Label, $Desc)
+function Write-BoxItem([string]$Key, [string]$Label, [string]$Desc, [string]$Mark = '') {
+    Write-Seg ('  ' + $script:bx.V + '  ') 'Cyan'
+    Write-Seg (Format-Cell $Key 2) 'Cyan' -Bold
+    Write-Seg ' '
+    Write-Seg (Format-Cell $Label 9) -Bold
+    Write-Seg ' '
+    Write-Seg (Format-Cell $Desc ($script:boxW - 15 - $Mark.Length))
+    Write-Seg $Mark 'Green'
+    Write-Seg $script:bx.V 'Cyan'
+    Write-EndLine
 }
-function Write-BoxKv([string]$Label, [string]$Value, [string]$Right = '') {
-    $left = '{0,-9} {1}' -f $Label, $Value
-    Write-BoxRow ($left.PadRight([math]::Max(0, $script:boxW - 2 - $Right.Length)) + $Right) 'DarkGray'
+function Write-BoxKv([string]$Label, [string]$Value, [string]$Color = '', [string]$Right = '') {
+    Write-Seg ('  ' + $script:bx.V + ' ') 'Cyan'
+    Write-Seg (Format-Cell $Label 9) 'DarkGray'
+    Write-Seg (Format-Cell $Value ($script:boxW - 11 - $Right.Length)) $Color
+    Write-Seg $Right 'DarkGray'
+    Write-Seg (' ' + $script:bx.V) 'Cyan'
+    Write-EndLine
 }
+# Returns @{ Text; Color; Batt } for the Phone row. Model and One UI are cached per serial,
+# the battery level is re-read on every refresh.
 function Get-TuiPhone {
+    $info = @{ Text = 'no phone: plug in USB, or p = pair'; Color = 'Red'; Batt = '' }
     Invoke-DeviceScan
     $s = ''; $via = ''
     if ($script:usbList.Count -gt 0) { $s = $script:usbList[0]; $via = 'USB' }
     elseif ($script:tcpList.Count -gt 0) { $s = $script:tcpList[0]; $via = 'Wi-Fi' }
-    elseif ($script:unauth.Count -gt 0) { return 'phone found, UNAUTHORIZED: accept the prompt on the phone' }
-    if (!$s) { return 'no phone found  (plug in USB, or p = pair)' }
+    elseif ($script:unauth.Count -gt 0) {
+        $info.Text = 'UNAUTHORIZED: accept the prompt on the phone'; $info.Color = 'Yellow'
+        return $info
+    }
+    if (!$s) { return $info }
+    $script:serial = $s
     if ($s -ne $script:tuiSeen) {
-        $script:serial = $s
-        $m = Get-PhoneValue @('getprop', 'ro.product.model')
+        $m = Get-PhoneValue @('getprop', 'ro.product.marketname')
+        if (!$m) { $m = Get-PhoneValue @('getprop', 'ro.product.model') }
         $ui = Get-OneUi
-        if ($ui) { $m = "$m, One UI $ui" }
+        if ($ui) { $m = "$m $($script:bx.Dot) One UI $ui" }
         $script:tuiModel = $m
         $script:tuiSeen = $s
     }
+    foreach ($l in @(Invoke-Phone @('dumpsys', 'battery'))) {
+        if ($l -match '^\s*level:\s*(\d+)') { $info.Batt = "$($Matches[1])%"; break }
+    }
     $name = if ($script:tuiModel) { $script:tuiModel } else { $s }
-    return "$name via $via"
+    $info.Text = "$name $($script:bx.Dot) $via"
+    $info.Color = 'Green'
+    return $info
 }
+# Draws one frame in place: cursor to the top of the window, every line padded to the console width,
+# then whatever is left below the prompt is blanked.
 function Show-Menu {
     if (!$script:scrcpyVer) {
         $script:scrcpyVer = if ((Get-ScrcpyLine) -match '^scrcpy\s+(\S+)') { $Matches[1] } else { '?' }
     }
+    $dot = $script:bx.Dot
     $screen = Get-Cfg 'DEX_SCREEN'
     if (!$screen) { $screen = 'on' }
     $mode = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { 'fullscreen' } else { 'window' }
     $res = Get-Cfg 'DEX_RES'
-    if (!$res) { $res = 'auto' }
+    if (!$res) { $res = "$(Get-DefaultResolution 80) auto" }
     $dpi = Get-Cfg 'DEX_DPI'
     if (!$dpi) { $dpi = 'auto' }
+    $last = Get-Cfg 'DEX_LAST_PROFILE'
+    if ($last -notin @('code', 'school', 'movie', 'mirror')) { $last = 'code' }
+    $mark = @{ code = ''; school = ''; movie = ''; mirror = '' }
+    $mark[$last] = 'last '
     $phone = Get-TuiPhone
-    Clear-Screen
-    Write-Host ''
+    $size = Get-ConsoleSize
+    $script:frameW = $size.Width
+    $script:col = 0
+    try { [Console]::SetCursorPosition(0, 0) } catch { Clear-Screen }
+    Write-EndLine
+    if ($size.Width -ge 64) {
+        foreach ($b in ($script:banner -split '\r?\n')) { Write-Seg ('  ' + $b) 'Cyan'; Write-EndLine }
+        Write-EndLine
+    }
     Write-BoxLine $script:bx.TL $script:bx.TR
     $right = "scrcpy $($script:scrcpyVer)"
-    Write-BoxRow ('Galaxy DeX'.PadRight([math]::Max(0, $script:boxW - 2 - $right.Length)) + $right)
+    Write-Seg ('  ' + $script:bx.V + ' ') 'Cyan'
+    Write-Seg (Format-Cell 'Galaxy DeX on your PC' ($script:boxW - 2 - $right.Length)) -Bold
+    Write-Seg $right 'DarkGray'
+    Write-Seg (' ' + $script:bx.V) 'Cyan'
+    Write-EndLine
     Write-BoxLine $script:bx.ML $script:bx.MR
-    Write-BoxKv 'Phone' $phone
-    Write-BoxKv 'Screen' "phone $screen" "$mode, $res @ $dpi"
+    Write-BoxKv 'Phone' $phone.Text $phone.Color $phone.Batt
+    Write-BoxKv 'Settings' "phone $screen $dot $mode $dot $res @ $dpi"
     Write-BoxLine $script:bx.ML $script:bx.MR
-    Write-BoxItem '1' 'Code' 'crisp text: coding, T3, browser'
-    Write-BoxItem '2' 'School' 'more room: Word / Excel side by side'
-    Write-BoxItem '3' 'Movie' 'high bitrate, H.265, smooth audio'
-    Write-BoxItem '4' 'Mirror' 'plain phone screen, no DeX'
+    Write-BoxItem '1' 'Code' 'crisp text: coding, T3, browser' $mark['code']
+    Write-BoxItem '2' 'School' 'more room: Word / Excel side by side' $mark['school']
+    Write-BoxItem '3' 'Movie' 'high bitrate, H.265, smooth audio' $mark['movie']
+    Write-BoxItem '4' 'Mirror' 'plain phone screen, no DeX' $mark['mirror']
     Write-BoxRow ''
     Write-BoxItem 'p' 'Pair' 'Wi-Fi pairing with a code (no cable)'
     Write-BoxItem 'c' 'Connect' 'reconnect over Wi-Fi'
@@ -596,27 +676,62 @@ function Show-Menu {
     Write-BoxItem 'u' 'Update' 're-run the installer'
     Write-BoxItem 'q' 'Quit' ''
     Write-BoxLine $script:bx.BL $script:bx.BR
-    if ($script:tuiMsg[0]) { Write-Host ('  ' + $script:tuiMsg[0]) -ForegroundColor $script:tuiMsg[1]; $script:tuiMsg = @('', 'Gray') }
-    Write-Host ('  Choose (Enter = 1) ' + $script:bx.Arrow + ' ') -NoNewline
+    if ($script:tuiMsg[0]) {
+        Write-Seg ('  ' + $script:tuiMsg[0]) $script:tuiMsg[1]
+    } else {
+        $hint = "  Enter = $last $dot F11 fullscreen in DeX $dot Alt+q closes DeX $dot menu refreshes itself"
+        Write-Seg $hint 'DarkGray'
+    }
+    Write-EndLine
+    Write-Seg ('  Choose ' + $script:bx.Arrow + ' ')
+    try {
+        $left = [Console]::CursorLeft; $top = [Console]::CursorTop
+        $rest = $script:frameW - 1 - $left
+        if ($rest -gt 0) { Write-Host (' ' * $rest) -NoNewline }
+        for ($r = $top + 1; $r -le $script:menuBottom; $r++) {
+            [Console]::SetCursorPosition(0, $r)
+            Write-Host (' ' * ($script:frameW - 1)) -NoNewline
+        }
+        [Console]::SetCursorPosition($left, $top)
+        $script:menuBottom = $top
+    } catch { Write-Verbose 'Cannot clear below the menu.' }
+}
+# Waits up to $Seconds for a key (polling every 200 ms); returns $null on timeout.
+function Wait-MenuKey([int]$Seconds) {
+    $deadline = [datetime]::UtcNow.AddSeconds($Seconds)
+    while ([datetime]::UtcNow -lt $deadline) {
+        if ([Console]::KeyAvailable) { return [Console]::ReadKey($true) }
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
 }
 # Runs a command, then waits for a key so its output can be read.
 function Invoke-MenuAction([scriptblock]$Action) {
     Clear-Screen
     $rc = 0
     try { $rc = Get-ExitCode (& $Action) } catch { Write-Err $_.Exception.Message; $rc = 1 }
-    if ($rc -ne 0) { $script:tuiMsg = @("Last command exited with code $rc.", 'DarkGray') }
+    if ($rc -eq 2) { $script:tuiMsg = @('No phone found. Plug in USB, or press p to pair over Wi-Fi.', 'Yellow') }
+    elseif ($rc -ne 0) { $script:tuiMsg = @("Last command exited with code $rc.", 'Yellow') }
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -NoNewline -ForegroundColor DarkGray
     [void][Console]::ReadKey($true)
+    Clear-Screen
 }
 function Invoke-Menu {
     Test-ToolInstallation
+    $profileKey = @{ code = '1'; school = '2'; movie = '3'; mirror = '4' }
+    Clear-Screen
     while ($true) {
         Show-Menu
-        $key = [Console]::ReadKey($true)
-        Write-Host ''
+        $key = Wait-MenuKey 5
+        if ($null -eq $key) { continue } # timeout: redraw to refresh the phone status
+        $script:tuiMsg = @('', 'DarkGray')
         $choice = ([string]$key.KeyChar).ToLowerInvariant()
-        if ($key.Key -eq 'Enter') { $choice = '1' } elseif ($key.Key -eq 'Escape') { $choice = 'q' }
+        if ($key.Key -eq 'Enter') {
+            $lastProfile = Get-Cfg 'DEX_LAST_PROFILE'
+            if ($lastProfile -notin @('school', 'movie', 'mirror')) { $lastProfile = 'code' }
+            $choice = $profileKey[$lastProfile]
+        } elseif ($key.Key -eq 'Escape') { $choice = 'q' }
         switch ($choice) {
             '1' { Invoke-MenuAction { Invoke-DexStart 'code' } }
             '2' { Invoke-MenuAction { Invoke-DexStart 'school' } }
@@ -630,39 +745,41 @@ function Invoke-Menu {
             'x' { Invoke-MenuAction { Invoke-Wake } }
             'h' { Invoke-MenuAction { Show-Help } }
             '?' { Invoke-MenuAction { Show-Help } }
-            'u' { return (Get-ExitCode (Invoke-Update)) }
+            'u' { Write-Host ''; return (Get-ExitCode (Invoke-Update)) }
             'q' { Write-Host ''; return 0 }
             's' {
                 $current = Get-Cfg 'DEX_SCREEN'
                 if ($current -eq 'dim') {
                     Save-ConfigValue 'DEX_SCREEN' 'off'
-                    $script:tuiMsg = @('Phone screen OFF while DeX runs. If DeX freezes on your phone, press x (wake) and switch back to on/dim.', 'Yellow')
+                    $script:tuiMsg = @('Phone screen OFF while DeX runs. If DeX freezes, press x (wake) and switch back to on/dim.', 'Yellow')
                 } elseif ($current -eq 'off') {
                     Save-ConfigValue 'DEX_SCREEN' 'on'
-                    $script:tuiMsg = @('Phone screen stays ON while DeX runs (safest).', 'Gray')
+                    $script:tuiMsg = @('Phone screen stays ON while DeX runs (safest).', 'Green')
                 } else {
                     Save-ConfigValue 'DEX_SCREEN' 'dim'
-                    $script:tuiMsg = @('Phone screen DIMMED while DeX runs (brightness restored on exit).', 'Gray')
+                    $script:tuiMsg = @('Phone screen DIMMED while DeX runs (brightness restored on exit).', 'Green')
                 }
             }
             'f' {
                 if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') {
                     Save-ConfigValue 'DEX_FULLSCREEN' '0'
-                    $script:tuiMsg = @('DeX starts in a resizable window (F11 toggles fullscreen).', 'Gray')
+                    $script:tuiMsg = @('DeX starts in a resizable window (F11 toggles fullscreen).', 'Green')
                 } else {
                     Save-ConfigValue 'DEX_FULLSCREEN' '1'
-                    $script:tuiMsg = @("DeX starts fullscreen at your monitor's resolution, like a real DeX monitor.", 'Gray')
+                    $script:tuiMsg = @("DeX starts fullscreen at your monitor's resolution, like a real DeX monitor.", 'Green')
                 }
             }
             'r' {
+                Write-Host ''
                 $newRes = Read-Host '  Window size WxH (empty = auto, 80% of screen)'
                 $newDpi = Read-Host '  DPI (empty = profile default; 160 normal, 140 denser, 200 bigger)'
+                Clear-Screen
                 if ($newRes -notmatch '^(\d+x\d+)?$') { $script:tuiMsg = @('Size must look like 1600x900.', 'Red') }
                 elseif ($newDpi -notmatch '^\d*$') { $script:tuiMsg = @('DPI must be a number.', 'Red') }
                 else {
                     Save-ConfigValue 'DEX_RES' $newRes
                     Save-ConfigValue 'DEX_DPI' $newDpi
-                    $script:tuiMsg = @('Saved.', 'Gray')
+                    $script:tuiMsg = @('Saved.', 'Green')
                 }
             }
             default { $script:tuiMsg = @("Unknown key '$choice'. Press 1-4 to start DeX, q to quit.", 'DarkGray') }

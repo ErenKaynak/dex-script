@@ -49,16 +49,23 @@ locked-down school PCs that reset on reboot. Just re-run the one-liner, it takes
 
 ## Usage
 
-Run `dex` and pick a number:
+Run `dex` and pick a number (the menu refreshes itself when you plug the phone in; Enter restarts
+the last profile):
 
 ```
+             _                   _
+    ___ _ __| | ____ _        __| | _____  __
+   / _ \ '__| |/ / _` |_____ / _` |/ _ \ \/ /
+  |  __/ |  |   < (_| |_____| (_| |  __/>  <
+   \___|_|  |_|\_\__,_|      \__,_|\___/_/\_\
+
   ╭──────────────────────────────────────────────────────────╮
-  │ Galaxy DeX                                  scrcpy 5.0.1 │
+  │ Galaxy DeX on your PC                       scrcpy 5.0.1 │
   ├──────────────────────────────────────────────────────────┤
-  │ Phone     SM-S931B, One UI 9.0 via USB                   │
-  │ Screen    phone on                     window, auto @ auto│
+  │ Phone    Galaxy S25 · One UI 9.0 · USB               87% │
+  │ Settings phone on · window · 1536x864 auto @ auto        │
   ├──────────────────────────────────────────────────────────┤
-  │  1  Code      crisp text: coding, T3, browser            │
+  │  1  Code      crisp text: coding, T3, browser       last │
   │  2  School    more room: Word / Excel side by side       │
   │  3  Movie     high bitrate, H.265, smooth audio          │
   │  4  Mirror    plain phone screen, no DeX                 │
@@ -75,7 +82,8 @@ Run `dex` and pick a number:
   │  u  Update    re-run the installer                       │
   │  q  Quit                                                 │
   ╰──────────────────────────────────────────────────────────╯
-  Choose (Enter = 1) ›
+  Enter = code · F11 fullscreen in DeX · Alt+q closes DeX · menu refreshes itself
+  Choose ›
 ```
 
 Everything is also a plain command, for scripts and shortcuts:
