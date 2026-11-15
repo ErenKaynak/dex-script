@@ -566,14 +566,15 @@ case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
   *) TL="+"; TR="+"; BL="+"; BR="+"; H="-"; V="|"; ML="+"; MR="+"; ARROW=">"; DOT="-" ;;
 esac
 BOX_W=58 # inner width
-BANNER="$(cat <<'EOF'
+# bash 3.2 (macOS) cannot parse a quote inside a here-doc inside $(...), so read it directly.
+IFS= read -r -d '' BANNER <<'EOF' || true
            _                   _
   ___ _ __| | ____ _        __| | _____  __
  / _ \ '__| |/ / _` |_____ / _` |/ _ \ \/ /
 |  __/ |  |   < (_| |_____| (_| |  __/>  <
  \___|_|  |_|\_\__,_|      \__,_|\___/_/\_\
 EOF
-)"
+BANNER="${BANNER%$'\n'}"
 
 term_cols() { local c="${COLUMNS:-}"; [ -n "$c" ] || c="$(tput cols 2>/dev/null || true)"; printf '%s' "${c:-80}"; }
 
