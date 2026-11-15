@@ -38,6 +38,7 @@ Commands:
   dex pair           wireless pairing without a cable
   dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
   dex wifi           switch a USB-connected phone to Wi-Fi
+  dex gui            small graphical launcher (zenity / kdialog / macOS dialogs)
   dex wake           wake the phone / unfreeze a stuck DeX window
   dex keyboard       open phone keyboard settings (pick Turkish Q)
   dex doctor         show versions, devices and phone info
@@ -735,6 +736,155 @@ tui_menu() {
   done
 }
 
+# --- graphical launcher (dex gui) --------------------------------------------------------
+# Small native dialog UI, zero dependencies: osascript on macOS, zenity or kdialog on Linux.
+# Falls back to the terminal menu when none exists. Command output goes to a log file and is
+# shown in an error dialog when something fails.
+GUI_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/dex/gui.log"
+
+gui_tool() { # prints osascript|zenity|kdialog or nothing
+  if [ "$OS" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then echo osascript
+  elif command -v zenity >/dev/null 2>&1; then echo zenity
+  elif command -v kdialog >/dev/null 2>&1; then echo kdialog
+  fi
+}
+gui_available() { [ -n "$(gui_tool)" ]; }
+
+as_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; } # AppleScript string escaping
+
+# gui_menu TEXT KEY LABEL [KEY LABEL ...] -> prints the chosen KEY, exit 1 on cancel
+gui_menu() {
+  local text="$1"; shift
+  case "$(gui_tool)" in
+    zenity)
+      zenity --list --title="erka-dex" --text="$text" --hide-header --width=460 --height=420 \
+        --column=key --column=action --hide-column=1 --print-column=1 "$@" 2>/dev/null ;;
+    kdialog)
+      kdialog --title "erka-dex" --menu "$text" "$@" 2>/dev/null ;;
+    osascript)
+      local items="" k l
+      while [ $# -ge 2 ]; do
+        k="$1"; l="$2"; shift 2
+        [ -n "$items" ] && items="$items, "
+        items="$items\"$k  $l\""
+      done
+      osascript -e "set c to choose from list {$items} with title \"erka-dex\" with prompt \"$(as_quote "$text")\" default items {\"$(printf '%s' "$items" | sed 's/^"\([^"]*\)".*/\1/')\"}" \
+        -e 'if c is false then error number -128' -e 'return item 1 of c' 2>/dev/null | awk '{print $1}' ;;
+    *) return 1 ;;
+  esac
+}
+gui_entry() { # gui_entry PROMPT -> prints text, exit 1 on cancel
+  case "$(gui_tool)" in
+    zenity) zenity --entry --title="erka-dex" --text="$1" 2>/dev/null ;;
+    kdialog) kdialog --title "erka-dex" --inputbox "$1" 2>/dev/null ;;
+    osascript) osascript -e "text returned of (display dialog \"$(as_quote "$1")\" default answer \"\" with title \"erka-dex\")" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+gui_error() { # gui_error TEXT
+  case "$(gui_tool)" in
+    zenity) zenity --error --title="erka-dex" --width=460 --text="$1" 2>/dev/null ;;
+    kdialog) kdialog --title "erka-dex" --error "$1" 2>/dev/null ;;
+    osascript) osascript -e "display dialog \"$(as_quote "$1")\" with title \"erka-dex\" buttons {\"OK\"} with icon stop" >/dev/null 2>&1 ;;
+  esac
+}
+gui_info() { # gui_info TEXT
+  case "$(gui_tool)" in
+    zenity) zenity --info --title="erka-dex" --width=520 --text="$1" 2>/dev/null ;;
+    kdialog) kdialog --title "erka-dex" --msgbox "$1" 2>/dev/null ;;
+    osascript) osascript -e "display dialog \"$(as_quote "$1")\" with title \"erka-dex\" buttons {\"OK\"} with icon note" >/dev/null 2>&1 ;;
+  esac
+}
+gui_notify() { # gui_notify TEXT (non-blocking)
+  case "$(gui_tool)" in
+    zenity) zenity --notification --text="$1" 2>/dev/null & ;;
+    kdialog) kdialog --title "erka-dex" --passivepopup "$1" 5 2>/dev/null & ;;
+    osascript) osascript -e "display notification \"$(as_quote "$1")\" with title \"erka-dex\"" 2>/dev/null ;;
+  esac
+}
+
+gui_status() { # prints a short status text for the dialog
+  tui_phone_status
+  local screen fullscreen
+  screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
+  if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then fullscreen=fullscreen; else fullscreen=window; fi
+  printf 'Phone: %s%s\nPhone screen: %s   Start: %s\n' "$TUI_PHONE" "${TUI_BATT:+ ($TUI_BATT)}" "$screen" "$fullscreen"
+}
+
+gui_run() { # gui_run FUNC ARGS... : run with output logged; error dialog with the log tail on failure
+  local rc
+  mkdir -p "$(dirname "$GUI_LOG")"
+  "$@" >"$GUI_LOG" 2>&1; rc=$?
+  case "$rc" in
+    0) ;;
+    2) gui_error "No phone found. Plug in the USB cable (accept the prompt on the phone) or pair over Wi-Fi." ;;
+    *) gui_error "$(tail -n 12 "$GUI_LOG")" ;;
+  esac
+  return "$rc"
+}
+
+gui_pair() {
+  local pair code ep
+  pair="$(gui_entry "Phone > Developer options > Wireless debugging > Pair device with pairing code.
+Pairing IP:port shown in that dialog:")" || return 0
+  code="$(gui_entry "6-digit pairing code:")" || return 0
+  if ! "$ADB" pair "$pair" "$code" >"$GUI_LOG" 2>&1; then gui_error "Pairing failed:
+$(tail -n 5 "$GUI_LOG")
+Same Wi-Fi network? School Wi-Fi may isolate devices: use a PC hotspot or the USB cable."; return 1; fi
+  if mdns_connect >>"$GUI_LOG" 2>&1; then gui_notify "Paired and connected over Wi-Fi."; return 0; fi
+  ep="$(gui_entry "Paired. Now the connect IP:port (Wireless debugging main screen):")" || return 0
+  if "$ADB" connect "$ep" 2>&1 | tee -a "$GUI_LOG" | connected_ok; then
+    cfg_set DEX_LAST_ENDPOINT "$ep"; gui_notify "Connected over Wi-Fi."
+  else
+    gui_error "Could not connect to $ep."; return 1
+  fi
+}
+
+cmd_gui() {
+  need_tools
+  if ! gui_available; then
+    # No dialog tool: open the terminal menu instead.
+    if [ -t 1 ]; then tui_menu; return $?; fi
+    local t
+    for t in x-terminal-emulator gnome-terminal konsole xfce4-terminal xterm; do
+      if command -v "$t" >/dev/null 2>&1; then exec "$t" -e "$0"; fi
+    done
+    die "No dialog tool (zenity/kdialog) and no terminal found. Run: dex"
+  fi
+  local choice last screen
+  while :; do
+    last="$(cfg_get DEX_LAST_PROFILE)"; case "$last" in school|movie|mirror) ;; *) last=code ;; esac
+    screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
+    choice="$(gui_menu "$(gui_status)" \
+      code "Code      - crisp text: coding, T3, browser" \
+      school "School    - more room: Word / Excel side by side" \
+      movie "Movie     - high bitrate, H.265, smooth audio" \
+      mirror "Mirror    - plain phone screen, no DeX" \
+      pair "Pair      - Wi-Fi pairing with a code (no cable)" \
+      connect "Connect   - reconnect over Wi-Fi" \
+      wifi "Wi-Fi     - USB plugged in, switch to Wi-Fi" \
+      screen "Screen    - phone panel while DeX runs (now: $screen)" \
+      window "Window    - toggle window / fullscreen start" \
+      keyboard "Keyboard  - phone keyboard layout (Turkish Q)" \
+      wake "Wake      - unfreeze a stuck DeX window" \
+      doctor "Doctor    - versions, devices, One UI check")" || return 0
+    case "$choice" in
+      code|school|movie|mirror) gui_run start "$choice" || true ;;
+      pair) gui_pair || true ;;
+      connect) gui_run cmd_connect && gui_notify "Connected over Wi-Fi." ;;
+      wifi) gui_run cmd_wifi && gui_notify "Connected over Wi-Fi. You can unplug the cable." ;;
+      keyboard) gui_run cmd_keyboard || true ;;
+      wake) gui_run cmd_wake && gui_notify "Wake-up sent to the phone." ;;
+      doctor) cmd_doctor >"$GUI_LOG" 2>&1; gui_info "$(sed 's/\x1b\[[0-9;]*m//g' "$GUI_LOG")" ;;
+      screen)
+        case "$screen" in dim) cfg_set DEX_SCREEN off ;; off) cfg_set DEX_SCREEN on ;; *) cfg_set DEX_SCREEN dim ;; esac ;;
+      window)
+        if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then cfg_set DEX_FULLSCREEN 0; else cfg_set DEX_FULLSCREEN 1; fi ;;
+      "") return 0 ;;
+    esac
+  done
+}
+
 # --- main -------------------------------------------------------------------------------
 MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_RAW=()
 CMD=""
@@ -756,6 +906,7 @@ while [ $# -gt 0 ]; do
     --fullscreen) OPT_FULLSCREEN=1; shift ;;
     --no-freeform) OPT_FREEFORM=0; shift ;;
     --menu|--tui) CMD=menu; shift ;;
+    --gui) CMD=gui; shift ;;
     -h|--help) CMD=help; shift ;;
     --) shift; OPT_RAW=("$@"); break ;;
     -*) die "Unknown option: $1 (see: dex help)" ;;
@@ -773,6 +924,7 @@ fi
 
 case "$CMD" in
   menu) tui_menu ;;
+  gui) cmd_gui ;;
   code|school|movie|mirror) start "$CMD" ;;
   pair) cmd_pair ;;
   connect) cmd_connect "${POS[0]:-}" ;;

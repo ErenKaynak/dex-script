@@ -92,6 +92,17 @@ selection, loops until `q`:
 - After an action: "Press any key to return to the menu". Errors (no device etc.) are shown in
   the menu instead of exiting.
 
+### Graphical launcher (`dex gui`)
+
+Zero-dependency dialogs: macOS `osascript` (choose from list / display dialog / notification),
+Linux `zenity` (`--list --hide-header --print-column`) or `kdialog` (`--menu`), Windows a WinForms
+form in `dex.ps1`. One list/button per menu action; command output goes to
+`~/.cache/dex/gui.log` (`%LOCALAPPDATA%\dex\gui.log`) and the tail is shown in an error dialog on
+failure (exit 2 → "No phone found" dialog). Pairing uses entry dialogs. The desktop entry runs
+`dex gui` (Terminal=false) when zenity/kdialog exists, with a "Terminal menu" action; the macOS
+`.command` and the Windows Start Menu shortcut launch the GUI, Windows keeps a "(terminal)"
+shortcut. Without any dialog tool `dex gui` falls back to the terminal menu.
+
 ### Start sequence (DeX profiles)
 
 1. Select device, resolve options.

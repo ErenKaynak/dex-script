@@ -86,6 +86,7 @@ Commands:
   dex connect [ip:port]  connect over Wi-Fi (no arg: auto-discover / last endpoint)
   dex wifi           switch a USB-connected phone to Wi-Fi
   dex wake           wake the phone / unfreeze a stuck DeX window
+  dex gui            small graphical launcher (WinForms window)
   dex keyboard       open phone keyboard settings (pick Turkish Q)
   dex doctor         show versions, devices and phone info
   dex update         re-run the installer (latest scripts)
@@ -511,8 +512,10 @@ function Invoke-Uninstall {
         [Environment]::SetEnvironmentVariable('Path', $clean, $scope)
     }
     foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {
-        $link = Join-Path $folder 'Galaxy DeX.lnk'
-        if (Test-Path $link) { Remove-Item -LiteralPath $link -Force }
+        foreach ($name in @('Galaxy DeX.lnk', 'Galaxy DeX (terminal).lnk')) {
+            $link = Join-Path $folder $name
+            if (Test-Path $link) { Remove-Item -LiteralPath $link -Force }
+        }
     }
     $bundledAdb = Join-Path $script:root 'scrcpy/adb.exe'
     if (Test-Path $bundledAdb) { $ErrorActionPreference = 'Continue'; & $bundledAdb kill-server 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
@@ -786,6 +789,188 @@ function Invoke-Menu {
         }
     }
 }
+# --- graphical launcher (assemblies loaded only on request) -------------------------
+function Invoke-Gui {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    $gui = @{
+        Form = New-Object System.Windows.Forms.Form
+        Status = New-Object System.Windows.Forms.Label
+        Button = @{}
+        Log = Join-Path $env:LOCALAPPDATA 'dex\gui.log'
+        Code = 0
+        Cancelled = $false
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path $gui.Log) | Out-Null
+    $gui.Form.Text = 'erka-dex'
+    $gui.Form.ClientSize = New-Object System.Drawing.Size(420, 520)
+    $gui.Form.FormBorderStyle = 'FixedDialog'
+    $gui.Form.MaximizeBox = $false
+    $gui.Form.StartPosition = 'CenterScreen'
+    $gui.Status.Location = New-Object System.Drawing.Point(12, 10)
+    $gui.Status.Size = New-Object System.Drawing.Size(396, 50)
+    $gui.Form.Controls.Add($gui.Status)
+
+    function Show-GuiMessage([string]$Text, [switch]$Failure) {
+        $icon = if ($Failure) { 'Error' } else { 'Information' }
+        [void][System.Windows.Forms.MessageBox]::Show($gui.Form, $Text, 'erka-dex', 'OK', $icon)
+    }
+    function Update-GuiStatus {
+        $screen = Get-Cfg 'DEX_SCREEN'
+        if ($screen -notin @('on', 'dim', 'off')) { $screen = 'on' }
+        $start = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { 'fullscreen' } else { 'window' }
+        try {
+            $phone = Get-TuiPhone
+            $text = $phone.Text.Replace(' - ', " $([char]0x00B7) ")
+            if ($phone.Batt) { $text += " ($($phone.Batt))" }
+        } catch { $text = 'no phone: plug in USB, or pair over Wi-Fi' }
+        $gui.Status.Text = "Phone: $text`r`nPhone screen: $screen   Start: $start"
+        $gui.Button.screen.Text = "Phone screen: $screen (click to change)"
+        $gui.Button.window.Text = "Start: $start (click to change)"
+        $last = Get-Cfg 'DEX_LAST_PROFILE'
+        foreach ($key in @('code', 'school', 'movie', 'mirror')) {
+            $button = $gui.Button[$key]
+            $button.Text = $button.AccessibleDescription
+            if ($key -eq $last) { $button.Text += ' (last)' }
+        }
+    }
+    function Invoke-GuiPair {
+        $endpoint = [Microsoft.VisualBasic.Interaction]::InputBox("Phone > Developer options > Wireless debugging > Pair device with pairing code.`r`nPairing IP:port shown in that dialog:", 'erka-dex')
+        if (!$endpoint) { return 0 }
+        $code = [Microsoft.VisualBasic.Interaction]::InputBox('6-digit pairing code:', 'erka-dex')
+        if (!$code) { return 0 }
+        try {
+            if ($endpoint -notmatch '^[^\s]+:\d+$' -or $code -notmatch '^\d{6}$') { throw 'Enter IP:port and a 6-digit pairing code.' }
+            Invoke-Adb -Arguments @('pair', $endpoint, $code) | ForEach-Object { Write-Host $_ }
+        } catch {
+            throw "Pairing failed:`r`n$($_.Exception.Message)`r`nSame Wi-Fi network? School Wi-Fi may isolate devices: use a PC hotspot or the USB cable."
+        }
+        if (Connect-DiscoveredEndpoint) {
+            Show-GuiMessage 'Paired and connected over Wi-Fi.'
+            return 0
+        }
+        $endpoint = [Microsoft.VisualBasic.Interaction]::InputBox('Paired. Now the connect IP:port (Wireless debugging main screen):', 'erka-dex')
+        if (!$endpoint) { return 0 }
+        try { Connect-Endpoint $endpoint } catch { throw "Could not connect to ${endpoint}. $($_.Exception.Message)" }
+        Show-GuiMessage 'Connected over Wi-Fi.'
+        return 0
+    }
+    function Invoke-GuiAction([string]$Name) {
+        $gui.Form.Enabled = $false
+        $timer.Stop()
+        $gui.Code = 0
+        $gui.Cancelled = $false
+        try {
+            # Capture all streams, including Write-Host's information stream in 5.1/7.
+            # Keep the success-stream return code separate from the redirected log.
+            & {
+                try {
+                    $result = switch ($Name) {
+                        { $_ -in @('code', 'school', 'movie', 'mirror') } { Invoke-DexStart $Name }
+                        'pair' { Test-ToolInstallation; Invoke-GuiPair }
+                        'connect' {
+                            Test-ToolInstallation
+                            if (Connect-DiscoveredEndpoint) { 0 }
+                            else {
+                                $endpoint = Get-Cfg 'DEX_LAST_ENDPOINT'
+                                if (!$endpoint) {
+                                    $endpoint = [Microsoft.VisualBasic.Interaction]::InputBox('Phone IP:port (Wireless debugging screen):', 'erka-dex')
+                                    if (!$endpoint) { $gui.Cancelled = $true; return }
+                                }
+                                Invoke-ConnectCmd $endpoint
+                            }
+                        }
+                        'wifi' { Invoke-Wifi }
+                        'keyboard' { Invoke-Keyboard }
+                        'wake' { Invoke-Wake }
+                        'doctor' { Invoke-Doctor }
+                    }
+                    $gui.Code = Get-ExitCode $result
+                    $result | Where-Object { $_ -isnot [int] }
+                } catch { $gui.Code = 1; Write-Output $_.Exception.Message }
+            } *>&1 | Out-File -LiteralPath $gui.Log -Encoding UTF8 -Width 200
+            if ($gui.Cancelled) { return }
+            if ($Name -eq 'doctor') {
+                Show-GuiMessage (Get-Content -LiteralPath $gui.Log -Raw) -Failure:($gui.Code -ne 0)
+            } elseif ($gui.Code -eq 2) {
+                Show-GuiMessage 'No phone found. Plug in the USB cable (accept the prompt on the phone) or pair over Wi-Fi.' -Failure
+            } elseif ($gui.Code -ne 0) {
+                Show-GuiMessage ((Get-Content -LiteralPath $gui.Log -Tail 12) -join "`r`n") -Failure
+            } else {
+                switch ($Name) {
+                    'connect' { Show-GuiMessage 'Connected over Wi-Fi.' }
+                    'wifi' { Show-GuiMessage 'Connected over Wi-Fi. You can unplug the cable.' }
+                    'keyboard' { Show-GuiMessage 'Opened the keyboard settings on the phone. Pick Turkish Q as the layout.' }
+                    'wake' { Show-GuiMessage 'Wake-up sent to the phone.' }
+                }
+            }
+        } catch { Show-GuiMessage $_.Exception.Message -Failure }
+        finally {
+            $gui.Form.Enabled = $true
+            Update-GuiStatus
+            $timer.Start()
+        }
+    }
+    $entry = @(
+        @('code', 'Code - crisp text: coding, T3, browser'),
+        @('school', 'School - more room: Word / Excel side by side'),
+        @('movie', 'Movie - high bitrate, H.265, smooth audio'),
+        @('mirror', 'Mirror - plain phone screen, no DeX'),
+        @('pair', 'Pair over Wi-Fi'), @('connect', 'Connect over Wi-Fi'),
+        @('wifi', 'USB -> Wi-Fi'), @('screen', ''), @('window', ''),
+        @('keyboard', 'Keyboard layout'), @('wake', 'Wake phone'), @('doctor', 'Doctor')
+    )
+    $top = 64
+    $boldFont = New-Object System.Drawing.Font($gui.Form.Font, [System.Drawing.FontStyle]::Bold)
+    foreach ($item in $entry) {
+        $button = New-Object System.Windows.Forms.Button
+        $button.Tag = $item[0]
+        $button.Text = $item[1]
+        $button.AccessibleDescription = $item[1]
+        $button.Location = New-Object System.Drawing.Point(12, $top)
+        $button.Size = New-Object System.Drawing.Size(396, 32)
+        if ($item[0] -in @('code', 'school', 'movie', 'mirror')) { $button.Font = $boldFont }
+        $button.Add_Click({
+            param($sender, $eventArgs)
+            # The event arguments are required by the WinForms delegate signature.
+            [void]$eventArgs
+            try {
+                switch ([string]$sender.Tag) {
+                    'screen' {
+                        $next = switch (Get-Cfg 'DEX_SCREEN') { 'dim' { 'off' }; 'off' { 'on' }; default { 'dim' } }
+                        Save-ConfigValue 'DEX_SCREEN' $next
+                        Update-GuiStatus
+                    }
+                    'window' {
+                        $next = if ((Get-Cfg 'DEX_FULLSCREEN') -eq '1') { '0' } else { '1' }
+                        Save-ConfigValue 'DEX_FULLSCREEN' $next
+                        Update-GuiStatus
+                    }
+                    default { Invoke-GuiAction ([string]$sender.Tag) }
+                }
+            } catch { Show-GuiMessage $_.Exception.Message -Failure }
+        })
+        $gui.Button[$item[0]] = $button
+        $gui.Form.Controls.Add($button)
+        $top += 36
+        if ($item[0] -eq 'mirror') { $top += 10 }
+    }
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 5000
+    $timer.Add_Tick({ Update-GuiStatus })
+    try {
+        Update-GuiStatus
+        $timer.Start()
+        [void]$gui.Form.ShowDialog()
+    } finally {
+        $timer.Stop()
+        $timer.Dispose()
+        $gui.Form.Dispose()
+        $boldFont.Dispose()
+    }
+    return 0
+}
 # --- main -------------------------------------------------------------------------
 try {
     $command = ''
@@ -806,6 +991,7 @@ try {
             '--wifi' { $script:opt.Mode = 'wifi' }
             '--screen-off' { $script:opt.Screen = 'off' }
             '--fullscreen' { $script:opt.Fullscreen = '1' }
+            '--gui' { $command = 'gui' }
             '--no-freeform' { $script:opt.Freeform = '0' }
             { $_ -in @('--menu', '--tui') } { $command = 'menu' }
             { $_ -in @('-h', '--help') } { $command = 'help' }
@@ -822,6 +1008,7 @@ try {
     $rc = 0
     switch ($command) {
         'menu' { $rc = Invoke-Menu }
+        'gui' { $rc = Invoke-Gui }
         { $_ -in @('code', 'school', 'movie', 'mirror') } { $rc = Invoke-DexStart $command }
         'pair' { $rc = Invoke-Pair }
         'connect' { $rc = Invoke-ConnectCmd $(if ($positional.Count -gt 0) { $positional[0] } else { '' }) }

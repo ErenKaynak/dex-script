@@ -67,6 +67,12 @@ try {
         $shell = New-Object -ComObject WScript.Shell
         foreach ($folder in @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'))) {
             $shortcut = $shell.CreateShortcut((Join-Path $folder 'Galaxy DeX.lnk'))
+            $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $bin 'dex.ps1') + '" gui'
+            $shortcut.WorkingDirectory = $root
+            $shortcut.IconLocation = (Join-Path $scrcpy 'scrcpy.exe') + ',0'
+            $shortcut.Save()
+            $shortcut = $shell.CreateShortcut((Join-Path $folder 'Galaxy DeX (terminal).lnk'))
             # Keep the console open when dex fails (e.g. no phone found) so the message can be read.
             $shortcut.TargetPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
             $shortcut.Arguments = '/c ""' + (Join-Path $bin 'dex.cmd') + '" || pause"'

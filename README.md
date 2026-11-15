@@ -86,6 +86,10 @@ the last profile):
   Choose ›
 ```
 
+Prefer buttons? `dex gui` opens a small native window instead of the terminal menu (zenity or
+kdialog on Linux, built-in dialogs on macOS, a WinForms window on Windows). The desktop / Start
+Menu launcher "Galaxy DeX" uses it when available; the terminal menu is always one `dex` away.
+
 Everything is also a plain command, for scripts and shortcuts:
 
 | Command | What it does |
@@ -97,6 +101,7 @@ Everything is also a plain command, for scripts and shortcuts:
 | `dex pair` | Wireless pairing with a 6-digit code (no cable) |
 | `dex connect [ip:port]` | Reconnect over Wi-Fi (auto-discovers the phone) |
 | `dex wifi` | USB plugged → switch to Wi-Fi, then unplug (until phone reboot) |
+| `dex gui` | Small graphical launcher (same actions as the menu) |
 | `dex wake` | Wake the phone / unfreeze a stuck DeX window |
 | `dex keyboard` | Open the phone's physical keyboard settings |
 | `dex doctor` | Show versions, devices, One UI version, power state |

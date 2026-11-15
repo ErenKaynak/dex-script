@@ -120,15 +120,22 @@ main() {
     if [ "$os" = "Linux" ]; then
       local appdir="$HOME/.local/share/applications"
       mkdir -p "$appdir"
+      # Graphical launcher when a dialog tool exists (zenity/kdialog), terminal menu otherwise.
+      local gui_exec="\"$bindir/dex\"" gui_term=true
+      if command -v zenity >/dev/null 2>&1 || command -v kdialog >/dev/null 2>&1; then gui_exec="\"$bindir/dex\" gui"; gui_term=false; fi
       cat > "$appdir/galaxy-dex.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Galaxy DeX
 Comment=Samsung DeX in a window (scrcpy)
-Exec="$bindir/dex"
+Exec=$gui_exec
 Icon=$root/scrcpy/scrcpy.png
-Terminal=true
+Terminal=$gui_term
 Categories=Utility;
+Actions=menu;
+[Desktop Action menu]
+Name=Terminal menu
+Exec="$bindir/dex"
 EOF
       ok "Added launcher: Galaxy DeX"
     else
@@ -136,7 +143,7 @@ EOF
       cat > "$HOME/Applications/Galaxy DeX.command" <<EOF
 #!/bin/bash
 export PATH="\$HOME/.local/bin:\$PATH"
-dex
+dex gui
 rc=\$?
 if [ \$rc -ne 0 ]; then
   echo
