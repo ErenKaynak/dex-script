@@ -77,7 +77,7 @@ Commands
 Options (any start command): `--res WxH` (initial size; default = 80% of primary screen if
 detectable, else 1600x900; with `--fullscreen` 100% / 1920x1080), `--dpi N`, `--usb`, `--wifi`,
 `--screen on|dim|off` (`--screen-off` = off), `--fullscreen`, `--no-freeform`, `--mouse uhid|sdk`,
-`--debug`, `--` then extra raw scrcpy args.
+`--display auto|overlay|virtual`, `--debug`, `--` then extra raw scrcpy args.
 
 ### Interactive menu (TUI)
 
@@ -89,8 +89,8 @@ selection, loops until `q`:
   line (`phone on|dim|off`, `window|fullscreen`, `res @ dpi`).
 - `Enter`/`1` Code, `2` School, `3` Movie, `4` Mirror, `p` Pair, `c` Connect, `w` Wi-Fi, `k`
   Keyboard, `s` cycle `DEX_SCREEN` on → dim → off, `f` toggle `DEX_FULLSCREEN`, `r` prompt
-  `DEX_RES` / `DEX_DPI`, `m` toggle `DEX_MOUSE` uhid ↔ sdk, `d` Doctor, `x` Wake, `l` Log (`dex
-  debug`), `u` Update, `h` help, `q`/Esc quit.
+  `DEX_RES` / `DEX_DPI`, `m` toggle `DEX_MOUSE` uhid ↔ sdk, `o` cycle `DEX_DISPLAY` auto → overlay
+  → virtual, `d` Doctor, `x` Wake, `l` Log (`dex debug`), `u` Update, `h` help, `q`/Esc quit.
 - Phone line when nothing is connected but a phone is remembered: `not connected: <name> (last at
   <ip>) · c = connect`.
 - After an action: "Press any key to return to the menu". Errors (no device etc.) are shown in
@@ -103,13 +103,32 @@ selection, loops until `q`:
    (scrcpy 5.0.1 never powers on the device for a new virtual display; a dozing Galaxy renders
    nothing). `dumpsys window policy` → KeyguardServiceDelegate `showing=true` → warn "unlock".
 3. **Freeform developer option** (unless `--no-freeform` / `DEX_FREEFORM=0` / mirror): wanted
-   value of `enable_freeform_support` = config `DEX_FREEFORM_SUPPORT` (0|1) if set, else **0 on
-   One UI 8.5+** (`ro.build.version.oneui` ≥ 80500) and 1 otherwise. If the current value differs
-   (`null` counts as 0), set it and restore the original after scrcpy exits (`null` →
-   `settings delete`). Why 0 on 8.5+/9: with the option on, the field test (S25, One UI 9) got
-   freeform windows whose title bar could not be dragged and whose close/minimize/maximize
-   buttons did nothing; sam1am/localdex reports draggable windows on One UI 9 with the same
-   server and windowing-mode fix and the option untouched. Not yet verified on device.
+   value of `enable_freeform_support` = config `DEX_FREEFORM_SUPPORT` (0|1) if set, else 1 below
+   One UI 8.5 and **unchanged on One UI 8.5+** (`ro.build.version.oneui` ≥ 80500). If the wanted
+   value differs from the current one (`null` counts as 0), set it and restore the original after
+   scrcpy exits (`null` → `settings delete`). Why unchanged on 8.5+/9: ATMS reads this setting
+   only at boot (`mSupportsFreeformWindowManagement`), so flipping it per session cannot change
+   windowing; the inert title bars seen with it on were the app-side legacy `DecorCaptionView`.
+3b. **Display kind** (`DEX_DISPLAY` / `--display`, default `auto` = overlay on One UI ≥ 8.5 or
+   non-Samsung Android 17+, else virtual). Measured on the S25 / One UI 9 (2026-11-15, adb):
+   on scrcpy's virtual display apps open as `mode=freeform` tasks with **no decoration at all**;
+   WM Shell logs `DesktopTaskChangeListener: onTaskOpening ... - desktop not supported` and
+   `desktopExternalDisplayIds=[]`. Android 17 source: `DesktopStateImpl.isDesktopModeSupportedOnDisplay`
+   → `IWindowManager.isEligibleForDesktopMode` → `DisplayContent.isEligibleForDesktopMode()` =
+   system decorations supported ∧ freeform supported ∧ (default display ∨
+   `allowContentModeSwitch()`), and `allowContentModeSwitch()` is false for any display with
+   `FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS`, which scrcpy's server sets (it would need
+   `VIRTUAL_DISPLAY_FLAG_ALLOWS_CONTENT_MODE_SWITCH` instead, scrcpy PR #7055). An **overlay
+   display** (`settings put global overlay_display_devices WxH/DPI`, `TYPE_OVERLAY`) has the
+   content-mode-switch flag by default, so it is desktop-eligible and DeX manages it like an
+   external monitor. Flow: `wake` → settings put → poll `dumpsys display` for a `type OVERLAY`
+   DisplayInfo (≤ 10 s) → `wm set-display-windowing-mode -d <id> 5` → scrcpy `--display-id=<id>`
+   (no `--new-display/--flex-display/--no-vd-destroy-content`) → on exit `settings delete global
+   overlay_display_devices` (tasks move back to the phone). If the display never appears, fall
+   back to the virtual display with a warning. Known costs: Android's `OverlayDisplayWindow`
+   preview on the phone (not hideable), fixed size per session. Open risk: localdex reports a
+   SystemUI NPE on caption drags of overlay displays on One UI 9 with injected input; untested
+   with the UHID mouse. The permanent fix is the patched scrcpy server (see `server/`).
    Opt-in config `DEX_FORCE_DESKTOP=1`: additionally set global
    `force_desktop_mode_on_external_displays` to 1 for the session (restored after, `null` →
    delete). AOSP then treats the virtual display like an external monitor (full desktop mode);
@@ -220,7 +239,8 @@ Over Wi-Fi lower defaults: bit-rate × 0.5 (code 8M, school 6M, movie 12M), keep
 Config file (KEY=VALUE, `#` comments) keys: `DEX_LAST_ENDPOINT`, `DEX_LAST_IP`,
 `DEX_PHONE_SERIAL`, `DEX_PHONE_NAME`, `DEX_SHORTCUT_MOD`, `DEX_DPI`, `DEX_RES`, `DEX_EXTRA_ARGS`,
 `DEX_SCREEN` (on|dim|off), `DEX_FULLSCREEN` (0|1), `DEX_FREEFORM` (0|1), `DEX_FREEFORM_SUPPORT`
-(0|1, unset = by One UI version), `DEX_MOUSE` (uhid|sdk, unset = by Android version),
+(0|1, unset = by One UI version), `DEX_DISPLAY` (overlay|virtual, unset = by One UI/Android
+version), `DEX_MOUSE` (uhid|sdk, unset = by Android version),
 `DEX_FORCE_DESKTOP` (0|1), `DEX_LAST_PROFILE`, `DEX_KEYBOARD_HINT_SHOWN`. Write config safely
 (replace key line or append).
 
@@ -236,8 +256,9 @@ Default window res = 80% of that, rounded down to multiples of 8.
   `DEX_DRY_RUN=1` (print the scrcpy command, exit 0), `DEX_NO_TUI=1`.
 - `tests/fake-phone.sh`: stub adb/scrcpy pair (Galaxy on One UI 9, dozing) that checks the whole
   start flow without hardware (wake, freeform fix on "New display", dim/restore, argument list,
-  mouse mode by Android version, force-desktop opt-in, debug log, remembered phone + mDNS
-  preference + `connect <port>`, exit 2 without device). Runs in CI.
+  mouse mode by Android version, overlay display create/freeform/remove and fallback, force-desktop
+  opt-in, debug log, remembered phone + mDNS preference + `connect <port>`, exit 2 without
+  device). Runs in CI.
 - First run: if config has no `DEX_KEYBOARD_HINT_SHOWN`, print Turkish Q hint once and set it.
 - Exit codes: 0 ok, 1 usage/runtime error, 2 no device.
 - Bash: `set -euo pipefail`, POSIX-ish bash 3.2 compatible (macOS ships bash 3.2: no associative

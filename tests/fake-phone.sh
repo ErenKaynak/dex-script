@@ -29,6 +29,9 @@ case "$*" in
   *"settings get system screen_brightness"*) echo 180 ;;
   *"settings get global enable_freeform_support"*) echo "${FAKE_FF:-1}" ;;
   *"wm set-display-windowing-mode"*) exit 0 ;;
+  *"settings put global overlay_display_devices"*) touch "$FAKE_LOG.overlay" ;;
+  *"settings delete global overlay_display_devices"*) rm -f "$FAKE_LOG.overlay" ;;
+  *"dumpsys display"*) if [ -e "$FAKE_LOG.overlay" ] && [ -z "${FAKE_NO_OVERLAY:-}" ]; then echo '    mBaseDisplayInfo=DisplayInfo{"Overlay #1", displayId 31, displayGroupId 0, FLAG_PRESENTATION, FLAG_TRUSTED, real 1536 x 864, type OVERLAY, uniqueId "overlay:1"}'; fi ;;
   version) echo "Android Debug Bridge version 1.0.41" ;;
   *) ;;
 esac
@@ -53,8 +56,14 @@ expect() { grep -qF -- "$1" "$log" || fail "expected call: $1"; }
 echo "# dry run prints the scrcpy command"
 : > "$log"
 export DEX_DRY_RUN=1
-out="$(bash "$here/bin/dex" code --res 1536x864 --dpi 160 --screen dim 2>&1)" || fail "dry run exit"
+out="$(bash "$here/bin/dex" code --res 1536x864 --dpi 160 --screen dim --display virtual 2>&1)" || fail "dry run exit"
 grep -q -- "--new-display=1536x864/160 --flex-display --no-vd-destroy-content" <<< "$out" || fail "virtual display args: $out"
+out2="$(bash "$here/bin/dex" code --res 1536x864 --dpi 160 2>&1)" || fail "dry run overlay exit"
+grep -q -- "--display-id=OVERLAY" <<< "$out2" || fail "One UI 9 defaults to the overlay display: $out2"
+grep -q -- "--new-display" <<< "$out2" && fail "overlay mode must not create a virtual display: $out2"
+out2="$(FAKE_ONEUI=80000 bash "$here/bin/dex" code 2>&1)"
+grep -q -- "--new-display=" <<< "$out2" || fail "One UI 8.0 keeps the virtual display: $out2"
+out2="$(bash "$here/bin/dex" code --display bogus 2>&1)" && fail "--display bogus must be rejected"
 grep -q -- "--keep-active" <<< "$out" || fail "--keep-active missing"
 grep -q -- "--stay-awake" <<< "$out" || fail "--stay-awake missing on USB"
 grep -q -- "--video-bit-rate=16M" <<< "$out" || fail "code bitrate"
@@ -75,27 +84,43 @@ out="$(bash "$here/bin/dex" mirror 2>&1)"
 grep -q -- "--mouse=" <<< "$out" && fail "mirror keeps scrcpy's default mouse: $out"
 
 echo "# screen off passes --turn-screen-off"
-out="$(bash "$here/bin/dex" code --screen-off 2>&1)"
+out="$(bash "$here/bin/dex" code --screen-off --display virtual 2>&1)"
 grep -q -- "--turn-screen-off" <<< "$out" || fail "--turn-screen-off missing: $out"
 
 echo "# fullscreen uses the full screen size"
-out="$(bash "$here/bin/dex" school --fullscreen 2>&1)"
+out="$(bash "$here/bin/dex" school --fullscreen --display virtual 2>&1)"
 grep -q -- "--fullscreen" <<< "$out" || fail "--fullscreen missing"
 grep -q -- "/140 " <<< "$out" || fail "school dpi 140: $out"
 
-echo "# full start: wake, freeform fix, dim + restore"
+echo "# full start on One UI 9: wake, overlay display, freeform fix on it, dim + restore, overlay removed"
 unset DEX_DRY_RUN
 : > "$log"
-out="$(bash "$here/bin/dex" code --screen dim 2>&1)" || fail "start exit code: $out"
+out="$(bash "$here/bin/dex" code --screen dim --res 1536x864 2>&1)" || fail "start exit code: $out"
 expect "input keyevent KEYCODE_WAKEUP"
-expect "settings put global enable_freeform_support 0" # One UI 8.5+: option off (title bar works)
-expect "settings put global enable_freeform_support 1" # restored afterwards
+grep -q "enable_freeform_support" "$log" && fail "One UI 8.5+: the freeform developer option must be left alone"
+expect "settings put global overlay_display_devices 1536x864/160"
+expect "wm set-display-windowing-mode -d 31 5"
+expect "scrcpy -s R5CX1234567 --display-id=31 --keyboard=uhid --mouse=uhid"
+expect "settings delete global overlay_display_devices"
 expect "settings put system screen_brightness 0"
 expect "settings put system screen_brightness 180"
 expect "settings put system screen_brightness_mode 1"
+grep -q "Overlay display 31 created" <<< "$out" || fail "overlay message: $out"
+[ -e "$log.overlay" ] && fail "overlay display must be removed on exit"
+awk '/scrcpy -s/{f=1} /settings delete global overlay_display_devices/{if(!f){exit 1}}' "$log" || fail "overlay removed only after scrcpy"
+
+echo "# full start, virtual display: freeform fix on New display"
+: > "$log"
+out="$(bash "$here/bin/dex" code --display virtual 2>&1)" || fail "virtual start exit code: $out"
 expect "wm set-display-windowing-mode -d 23 5"
 grep -q "Desktop windowing enabled on DeX display 23" <<< "$out" || fail "freeform message: $out"
-awk '/wm set-display-windowing-mode/{f=1} /screen_brightness 180/{if(!f){exit 1}}' "$log" || fail "brightness restored before freeform fix"
+grep -q "overlay_display_devices" "$log" && fail "virtual mode must not touch the overlay setting"
+
+echo "# overlay display never appears -> falls back to the virtual display"
+: > "$log"
+out="$(FAKE_NO_OVERLAY=1 bash "$here/bin/dex" code 2>&1)" || fail "fallback exit: $out"
+expect "scrcpy -s R5CX1234567 --new-display="
+grep -q "falling back" <<< "$out" || fail "fallback message: $out"
 grep -q "force_desktop_mode_on_external_displays 1" "$log" && fail "force desktop is opt-in"
 grep -q "^DEX_PHONE_SERIAL=R5CX1234567$" "$tmp/cfg/config" || fail "phone serial remembered"
 grep -q "^DEX_PHONE_NAME=Galaxy S25$" "$tmp/cfg/config" || fail "phone name remembered"
@@ -121,15 +146,11 @@ FAKE_ONEUI=80000 FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail 
 expect "settings put global enable_freeform_support 1"
 expect "settings delete global enable_freeform_support"
 
-echo "# One UI 9 with the option unset: left alone"
+echo "# config DEX_FREEFORM_SUPPORT=0 forces the option off on One UI 9 and restores it"
 : > "$log"
-FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail "unset start"
-grep -q "settings put global enable_freeform_support\|settings delete global enable_freeform_support" "$log" && fail "unset option must stay untouched"
-
-echo "# config DEX_FREEFORM_SUPPORT=1 overrides the One UI default"
-: > "$log"
-echo "DEX_FREEFORM_SUPPORT=1" >> "$tmp/cfg/config"
-FAKE_FF=null bash "$here/bin/dex" code >/dev/null 2>&1 || fail "override start"
+echo "DEX_FREEFORM_SUPPORT=0" >> "$tmp/cfg/config"
+bash "$here/bin/dex" code >/dev/null 2>&1 || fail "override start"
+expect "settings put global enable_freeform_support 0"
 expect "settings put global enable_freeform_support 1"
 sed -i.bak '/^DEX_FREEFORM_SUPPORT=/d' "$tmp/cfg/config"
 
@@ -138,16 +159,19 @@ echo "# mirror does not touch freeform"
 bash "$here/bin/dex" mirror >/dev/null 2>&1 || fail "mirror exit"
 grep -q "settings put global enable_freeform_support" "$log" && fail "mirror must not change freeform support"
 grep -q "wm set-display-windowing-mode" "$log" && fail "mirror must not force windowing (no New display line expected)"
+grep -q "overlay_display_devices" "$log" && fail "mirror must not create an overlay display"
 
 echo "# --no-freeform skips the fix"
 : > "$log"
 bash "$here/bin/dex" code --no-freeform >/dev/null 2>&1 || fail "no-freeform exit"
 grep -q "wm set-display-windowing-mode" "$log" && fail "--no-freeform must skip the windowing fix"
+expect "scrcpy -s R5CX1234567 --display-id=31"
 
 echo "# doctor"
 out="$(bash "$here/bin/dex" doctor 2>&1)" || fail "doctor exit: $out"
 grep -q "One UI:  9.0" <<< "$out" || fail "doctor One UI: $out"
 grep -q "mouse mode:       uhid" <<< "$out" || fail "doctor mouse: $out"
+grep -q "display mode:     overlay" <<< "$out" || fail "doctor display: $out"
 grep -q "remembered: Galaxy S25" <<< "$out" || fail "doctor remembered phone: $out"
 
 echo "# wake"

@@ -54,6 +54,12 @@ Options (start commands):
   --screen-off       same as --screen off
   --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
   --no-freeform      skip the One UI 8.5+/9 windowing fix
+  --display auto|overlay|virtual
+                     overlay (default on One UI 8.5+/9): DeX runs on a system overlay
+                     display, the only kind Android 16 QPR2+/17 gives real desktop windows
+                     (title bars, drag, resize, minimize). Android shows a small preview of
+                     it on the phone screen. virtual: scrcpy's own display (resizes with the
+                     window, but on One UI 8.5+/9 apps have no title bars).
   --mouse uhid|sdk   uhid (default on Android 15+): real HID mouse on the DeX display,
                      DeX title bars drag like with a plugged-in mouse (Alt releases the
                      PC pointer). sdk: injected touch-style clicks, pointer not captured.
@@ -66,7 +72,8 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: $CONFIG
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
-  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_MOUSE (uhid|sdk),
+  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
+  DEX_DISPLAY (auto|overlay|virtual), DEX_MOUSE (uhid|sdk),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 EOF
@@ -288,13 +295,14 @@ dim_off() {
 }
 
 # The "Enable freeform windows" developer option (global enable_freeform_support), set for the
-# session and restored on exit. One UI 8.0 builds may need it on. On One UI 8.5+/9 it is kept
-# off: with it on, the DeX title bar's drag and close/minimize/maximize buttons did nothing in a
-# field test, while sam1am/localdex gets draggable windows on One UI 9 with only the forced
-# display windowing mode and the option untouched.
+# session and restored on exit. One UI 8.0 builds may need it on. On One UI 8.5+/9 the phone's
+# value is left alone: the framework only reads it at boot (ATMS mSupportsFreeformWindowManagement),
+# so flipping it per session cannot help and the earlier "keep it off" idea was wrong (the inert
+# title bars it produced were the app-side legacy caption, see DESIGN.md).
 SAVED_FREEFORM_SUPPORT=""
-freeform_support_set() { # freeform_support_set 0|1
+freeform_support_set() { # freeform_support_set 0|1|"" ("" = leave alone)
   local cur
+  case "$1" in 0|1) ;; *) return 0 ;; esac
   cur="$(phone_shell settings get global enable_freeform_support)"
   case "$cur" in
     "$1"|"") return 0 ;; # already right, or unreadable
@@ -306,13 +314,52 @@ freeform_support_set() { # freeform_support_set 0|1
     say "${C_DIM}Freeform developer option off while DeX runs (it breaks window dragging on One UI 8.5+).${C_OFF}"
   fi
 }
-want_freeform_support() { # prints 0|1: config DEX_FREEFORM_SUPPORT, else by One UI version
+want_freeform_support() { # prints 0|1|"": config DEX_FREEFORM_SUPPORT, else 1 below One UI 8.5, else ""
   local v
   v="$(cfg_get DEX_FREEFORM_SUPPORT)"
   case "$v" in 0|1) echo "$v"; return ;; esac
   v="$(phone_shell getprop ro.build.version.oneui)"
-  case "$v" in [0-9]*) [ "$v" -ge 80500 ] && { echo 0; return; } ;; esac
+  case "$v" in [0-9]*) [ "$v" -ge 80500 ] && { echo ""; return; } ;; esac
   echo 1
+}
+
+# --- overlay display ------------------------------------------------------------------------
+# Android 16 QPR2+/17 (One UI 8.5+/9) runs desktop windowing (title bars, drag, resize, minimize)
+# only on displays whose content mode can switch between mirror and extend
+# (DisplayContent.isEligibleForDesktopMode -> allowContentModeSwitch). scrcpy's virtual display is
+# created with "always show system decorations", which excludes it: WM Shell logs "desktop not
+# supported" and never decorates the windows. A system *overlay* display (developer setting
+# overlay_display_devices) is eligible, DeX manages it like an external monitor, and scrcpy mirrors
+# it with --display-id. Cost: Android draws a small preview of it on the phone screen, and its size
+# is fixed for the session (no --flex-display).
+OVERLAY_ID=""
+overlay_create() { # overlay_create WxH DPI -> sets OVERLAY_ID; 1 if the display never appeared
+  local i=0 id=""
+  phone_shell settings put global overlay_display_devices "$1/$2" >/dev/null
+  while [ $i -lt 40 ]; do
+    id="$(phone_shell dumpsys display | grep 'type OVERLAY' | sed -n 's/.*displayId \([0-9]*\),.*/\1/p' | head -n 1)"
+    if [ -n "$id" ]; then OVERLAY_ID="$id"; return 0; fi
+    sleep 0.25; i=$((i+1))
+  done
+  phone_shell settings delete global overlay_display_devices >/dev/null
+  return 1
+}
+overlay_destroy() {
+  [ -n "$OVERLAY_ID" ] || return 0
+  phone_shell settings delete global overlay_display_devices >/dev/null
+  OVERLAY_ID=""
+}
+want_display() { # prints overlay|virtual: --display, config DEX_DISPLAY, else by One UI / Android version
+  local v ui sdk
+  v="${OPT_DISPLAY:-$(cfg_get DEX_DISPLAY)}"
+  case "$v" in overlay|virtual) echo "$v"; return ;; esac
+  ui="$(phone_shell getprop ro.build.version.oneui)"
+  case "$ui" in
+    [0-9]*) if [ "$ui" -ge 80500 ]; then echo overlay; else echo virtual; fi; return ;;
+  esac
+  sdk="$(phone_shell getprop ro.build.version.sdk)"
+  case "$sdk" in [0-9]*) [ "$sdk" -ge 37 ] && { echo overlay; return; } ;; esac
+  echo virtual
 }
 freeform_support_off() {
   case "$SAVED_FREEFORM_SUPPORT" in
@@ -364,7 +411,7 @@ mod_name() { # human name of the shortcut mod
   case "$1" in lsuper|rsuper) echo "Cmd" ;; lctrl|rctrl) echo "Ctrl" ;; *) echo "Alt" ;; esac
 }
 
-restore_phone() { dim_off; freeform_support_off; force_desktop_off; }
+restore_phone() { dim_off; freeform_support_off; force_desktop_off; overlay_destroy; }
 
 # --- screen size --------------------------------------------------------------------
 detect_screen() { # prints "WxH" or nothing
@@ -436,6 +483,10 @@ debug_start() {
   { say "dex debug $(date)"; say "scrcpy: $*"; say "phone: $(phone_shell getprop ro.product.model) One UI $(phone_shell getprop ro.build.version.oneui) SDK $(phone_shell getprop ro.build.version.sdk)"
     say "settings: freeform_support=$(phone_shell settings get global enable_freeform_support) force_desktop=$(phone_shell settings get global force_desktop_mode_on_external_displays)"
   } > "$DEBUG_LOG"
+  if [ -n "$OVERLAY_ID" ]; then
+    { printf '==== dumpsys window displays (overlay display %s, before scrcpy) ====\n' "$OVERLAY_ID"
+      phone_shell dumpsys window displays; } >> "$DEBUG_LOG.dumpsys" 2>/dev/null
+  fi
   "$ADB" -s "$SERIAL" logcat -c >/dev/null 2>&1 || true
   "$ADB" -s "$SERIAL" logcat -v threadtime '*:D' >> "$DEBUG_LOG" 2>&1 &
   LOGCAT_PID=$!
@@ -462,7 +513,7 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
     cfg_set DEX_KEYBOARD_HINT_SHOWN 1
   fi
 
-  local dpi bitrate res codec="h264" mod screen fullscreen mouse
+  local dpi bitrate res codec="h264" mod screen fullscreen mouse display
   local extra_profile=()
   case "$profile" in
     code) bitrate=16 ;;
@@ -495,11 +546,17 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   [ "$profile" != "mirror" ] || FREEFORM=0 # no virtual display to fix
 
   mouse="$(want_mouse)"
+  display=virtual
+  [ "$profile" = "mirror" ] || display="$(want_display)"
 
   local args=(-s "$SERIAL")
   if [ "$profile" != "mirror" ]; then
-    args+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content
-      --keyboard=uhid "--mouse=$mouse" --mouse-bind=++++:bhsn)
+    if [ "$display" = overlay ]; then
+      args+=("--display-id=OVERLAY") # replaced by the real id once the overlay display exists
+    else
+      args+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content)
+    fi
+    args+=(--keyboard=uhid "--mouse=$mouse" --mouse-bind=++++:bhsn)
   fi
   args+=("--window-title=Galaxy DeX ($profile)" "--shortcut-mod=$mod")
   # --keep-active: simulated user activity keeps the phone from sleeping on USB *and* Wi-Fi
@@ -535,9 +592,26 @@ start() { # start PROFILE -> returns 0 ok, 1 error, 2 no device
   wake_phone
   if [ "$FREEFORM" = 1 ]; then freeform_support_set "$(want_freeform_support)"; force_desktop_on; fi
   if [ "$screen" = dim ]; then dim_on; fi
-  if [ "${OPT_DEBUG:-0}" = 1 ]; then debug_start "${args[@]}"; fi
   trap 'restore_phone; debug_stop' INT TERM # Ctrl+C: scrcpy exits on its own, we just clean up
-  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen, mouse: $mouse)..."
+  if [ "$display" = overlay ]; then
+    if overlay_create "$res" "$dpi"; then
+      ok "Overlay display $OVERLAY_ID created ($res @ $dpi dpi): DeX runs on it like on an external monitor."
+      say "${C_DIM}Android shows a small preview of it on the phone screen; ignore it. Size is fixed for this session (r = change).${C_OFF}"
+      [ "$FREEFORM" = 1 ] && enable_freeform "$OVERLAY_ID"
+      local i
+      for i in "${!args[@]}"; do [ "${args[$i]}" = "--display-id=OVERLAY" ] && args[i]="--display-id=$OVERLAY_ID"; done
+    else
+      warn "Could not create the overlay display; falling back to scrcpy's virtual display (no window title bars on One UI 8.5+)."
+      display=virtual
+      local rebuilt=() a
+      for a in "${args[@]}"; do
+        if [ "$a" = "--display-id=OVERLAY" ]; then rebuilt+=("--new-display=$res/$dpi" --flex-display --no-vd-destroy-content); else rebuilt+=("$a"); fi
+      done
+      args=("${rebuilt[@]}")
+    fi
+  fi
+  if [ "${OPT_DEBUG:-0}" = 1 ]; then debug_start "${args[@]}"; fi
+  say "Starting Galaxy DeX ($profile, $TRANSPORT, $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display)..."
   local modn; modn="$(mod_name "$mod")"
   say "${C_DIM}Resize the window freely. F11 = fullscreen, $modn+q quits. Frozen? Run: dex wake${C_OFF}"
   if [ "$profile" != "mirror" ] && [ "$mouse" = uhid ]; then
@@ -721,7 +795,9 @@ cmd_doctor() {
   [ -n "$wk" ] && say "power:   $wk"
   local ffs
   ffs="$(phone_shell settings get global enable_freeform_support)"
-  say "freeform support: $ffs (dex sets it to $(want_freeform_support) while DeX runs)"
+  local wff; wff="$(want_freeform_support)"
+  say "freeform support: $ffs (dex sets it to ${wff:-<unchanged>} while DeX runs)"
+  say "display mode:     $(want_display) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
   say "force desktop:    $(phone_shell settings get global force_desktop_mode_on_external_displays) (DEX_FORCE_DESKTOP=$(cfg_get DEX_FORCE_DESKTOP))"
   say "mouse mode:       $(want_mouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
   local rp
@@ -828,6 +904,7 @@ tui_frame() { # prints one full frame
   ver="$("$SCRCPY" --version 2>/dev/null | head -n 1 | awk '{print $2}')"
   screen="$(cfg_get DEX_SCREEN)"; [ -n "$screen" ] || screen=on
   mouse="$(cfg_get DEX_MOUSE)"; [ -n "$mouse" ] || mouse="auto"
+  local dmode; dmode="$(cfg_get DEX_DISPLAY)"; [ -n "$dmode" ] || dmode="auto"
   if [ "$(cfg_get DEX_FULLSCREEN)" = 1 ]; then fullscreen="fullscreen"; else fullscreen="window"; fi
   res="$(cfg_get DEX_RES)"; [ -n "$res" ] || res="$(default_res 80) auto"
   dpi="$(cfg_get DEX_DPI)"; [ -n "$dpi" ] || dpi="auto"
@@ -843,7 +920,7 @@ tui_frame() { # prints one full frame
   printf '  %s%s%s %s%s%s%s%s%s %s%s%s\n' "$C_CYAN" "$V" "$C_OFF" "$C_B" "$(pad "Galaxy DeX on your PC" $((BOX_W-2-${#ver}-7)))" "$C_OFF" "$C_DIM" "scrcpy $ver" "$C_OFF" "$C_CYAN" "$V" "$C_OFF"
   hline "$ML" "$MR"
   row_kv "Phone" "$TUI_PHONE" "$TUI_PHONE_C" "$TUI_BATT"
-  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT mouse $mouse $DOT $res @ $dpi"
+  row_kv "Settings" "phone $screen $DOT $fullscreen $DOT $dmode $DOT mouse $mouse $DOT $res @ $dpi"
   hline "$ML" "$MR"
   local m1="" m2="" m3="" m4=""
   case "$last" in code) m1="last " ;; school) m2="last " ;; movie) m3="last " ;; mirror) m4="last " ;; esac
@@ -860,6 +937,7 @@ tui_frame() { # prints one full frame
   row_item f "Window" "toggle window / fullscreen start"
   row_item r "Size" "set window size and DPI"
   row_item m "Mouse" "real HID mouse (uhid) / injected touch (sdk)"
+  row_item o "Display" "auto / overlay (One UI 9 windows) / virtual"
   row_item d "Doctor" "versions, devices, One UI check"
   row_item x "Wake" "unfreeze a stuck DeX window"
   row_item l "Log" "start Code with a phone log for bug reports"
@@ -915,6 +993,12 @@ tui_menu() {
       d|D) tui_run cmd_doctor ;;
       x|X) tui_run cmd_wake ;;
       l|L) OPT_DEBUG=1; tui_run start code; OPT_DEBUG=0 ;;
+      o|O)
+        case "$(cfg_get DEX_DISPLAY)" in
+          overlay) cfg_set DEX_DISPLAY virtual; tui_msg "Display: scrcpy virtual display (resizes with the window; no title bars on One UI 8.5+/9)." "$C_WARN" ;;
+          virtual) cfg_set DEX_DISPLAY ""; tui_msg "Display: auto (overlay on One UI 8.5+/9, virtual otherwise)." "$C_OK" ;;
+          *) cfg_set DEX_DISPLAY overlay; tui_msg "Display: overlay (real desktop windows; fixed size; preview on the phone screen)." "$C_OK" ;;
+        esac ;;
       m|M)
         case "$(cfg_get DEX_MOUSE)" in
           sdk) cfg_set DEX_MOUSE uhid; tui_msg "Mouse: real HID mouse on the DeX display (title bars drag like native DeX; Alt releases the pointer)." "$C_OK" ;;
@@ -945,7 +1029,7 @@ tui_menu() {
 }
 
 # --- main -------------------------------------------------------------------------------
-MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_MOUSE=""; OPT_DEBUG=0; OPT_RAW=()
+MODE=auto; OPT_RES=""; OPT_DPI=""; OPT_SCREEN=""; OPT_FULLSCREEN=""; OPT_FREEFORM=""; OPT_MOUSE=""; OPT_DISPLAY=""; OPT_DEBUG=0; OPT_RAW=()
 CMD=""
 if [ $# -gt 0 ]; then
   case "$1" in -*) ;; *) CMD="$1"; shift ;; esac
@@ -966,6 +1050,8 @@ while [ $# -gt 0 ]; do
     --no-freeform) OPT_FREEFORM=0; shift ;;
     --mouse) [ $# -ge 2 ] || die "--mouse needs uhid or sdk"; OPT_MOUSE="$2"; shift 2 ;;
     --mouse=*) OPT_MOUSE="${1#*=}"; shift ;;
+    --display) [ $# -ge 2 ] || die "--display needs auto, overlay or virtual"; OPT_DISPLAY="$2"; shift 2 ;;
+    --display=*) OPT_DISPLAY="${1#*=}"; shift ;;
     --debug) OPT_DEBUG=1; shift ;;
     --menu|--tui) CMD=menu; shift ;;
     -h|--help) CMD=help; shift ;;
@@ -978,6 +1064,8 @@ case "$OPT_RES" in ""|[0-9]*x[0-9]*) ;; *) die "--res must look like 1600x900" ;
 case "$OPT_DPI" in ""|[0-9]*) ;; *) die "--dpi must be a number" ;; esac
 case "$OPT_SCREEN" in ""|on|dim|off) ;; *) die "--screen must be on, dim or off" ;; esac
 case "$OPT_MOUSE" in ""|uhid|sdk) ;; *) die "--mouse must be uhid or sdk" ;; esac
+case "$OPT_DISPLAY" in ""|auto|overlay|virtual) ;; *) die "--display must be auto, overlay or virtual" ;; esac
+[ "$OPT_DISPLAY" != auto ] || OPT_DISPLAY=""
 
 if [ -z "$CMD" ]; then
   # No command: interactive menu on a terminal, otherwise the default profile (scripts, CI).

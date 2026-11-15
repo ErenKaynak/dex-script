@@ -5,10 +5,11 @@
 Run **Samsung DeX** from a Galaxy phone (One UI 8+, e.g. Galaxy S25 on One UI 9) inside a
 **resizable window** on Linux, macOS or Windows — over **USB or Wi-Fi**, no admin rights needed.
 
-It uses [scrcpy](https://github.com/Genymobile/scrcpy)'s virtual display: since One UI 8, DeX runs
-on any virtual display, and `--flex-display` resizes that display with the window, so DeX apps can
-be snapped, resized and multitasked like on a real desktop. `dex` also applies the fixes that
-One UI 8.5/9 needs (see [How it works](#how-it-works)).
+It uses [scrcpy](https://github.com/Genymobile/scrcpy) to mirror a second display of the phone.
+On One UI 8.0 that is scrcpy's own virtual display, which resizes with the window. On One UI 8.5/9
+(Android 16 QPR2+/17) `dex` instead creates a system *overlay display*, the only kind of display
+those versions give real desktop windows on (title bars, drag, resize, minimize), and mirrors it
+(see [How it works](#how-it-works)).
 
 ## Install (one line)
 
@@ -78,6 +79,7 @@ the last profile):
   │  f  Window    toggle window / fullscreen start           │
   │  r  Size      set window size and DPI                    │
   │  m  Mouse     real HID mouse (uhid) / touch (sdk)        │
+  │  o  Display   auto / overlay (One UI 9 windows) / virtual│
   │  d  Doctor    versions, devices, One UI check            │
   │  x  Wake      unfreeze a stuck DeX window                │
   │  l  Log       start Code with a phone log (bug reports)  │
@@ -107,14 +109,29 @@ Everything is also a plain command, for scripts and shortcuts:
 
 Options: `--res 1920x1080`, `--dpi 140`, `--usb`, `--wifi`, `--screen on|dim|off`,
 `--fullscreen` (start at your monitor's resolution, like a real DeX monitor), `--no-freeform`,
-`--mouse uhid|sdk`, `--debug`, and `-- <extra scrcpy args>`.
+`--mouse uhid|sdk`, `--display auto|overlay|virtual`, `--debug`, and `-- <extra scrcpy args>`.
 
 Profiles only change quality settings. Every profile keeps the window resizable and DeX fully
 multitasking. Closing the window doesn't kill your apps; they move back to the phone.
 
 Settings persist in `~/.config/dex/config` (Windows: `%APPDATA%\dex\config`), e.g.
 `DEX_SCREEN=dim`, `DEX_FULLSCREEN=1`, `DEX_DPI=150`, `DEX_RES=2560x1440`, `DEX_SHORTCUT_MOD=lalt`,
-`DEX_MOUSE=sdk`, `DEX_EXTRA_ARGS=...`. The menu keys `s`, `f`, `r` and `m` write these for you.
+`DEX_MOUSE=sdk`, `DEX_DISPLAY=virtual`, `DEX_EXTRA_ARGS=...`. The menu keys `s`, `f`, `r`, `m` and
+`o` write these for you.
+
+### Display: overlay vs virtual (One UI 8.5 / 9)
+
+Android 16 QPR2+ (the base of One UI 8.5/9) only runs desktop windowing, the thing that gives
+windows a title bar you can drag, resize buttons and minimize, on displays whose content mode can
+switch between "mirror" and "extend". scrcpy's own virtual display is created as "always show
+system decorations", which excludes it: DeX starts on it and apps open as frameless freeform
+windows that cannot be moved. So on One UI 8.5+ `dex` creates a system **overlay display**
+(the developer setting `overlay_display_devices`) at your window size, which DeX manages like a
+real external monitor, and mirrors it with `--display-id`. Two side effects: Android draws a small
+preview of that display on the phone screen (ignore it; `s` dims the phone), and the display size
+is fixed for the session (`r` sets it; the window itself still scales). `o` in the menu or
+`--display virtual` switches back to scrcpy's virtual display. The overlay display is removed when
+DeX closes and your apps move back to the phone.
 
 ### Mouse: why the DeX window captures your pointer
 
@@ -189,14 +206,15 @@ YouTube, local video files, Plex/Jellyfin and most non-DRM players work fine in 
   when the DeX display appears (you'll see "Desktop windowing enabled on DeX display N"). Apps that
   were already open before that line stay fullscreen: close and reopen them. If the line never
   shows up, run `dex doctor` and check the One UI version.
-- **Windows open as windows, but the title bar can't be dragged and its buttons do nothing**:
-  make sure the mouse mode is `uhid` (`dex doctor` shows it; menu `m` toggles it) and that the
-  pointer is captured (click inside the window). If it still fails: try `m` once more (`sdk`),
-  then put `DEX_FORCE_DESKTOP=1` in the config (Android's "force desktop mode on external
-  displays" developer setting, set only while DeX runs). Still stuck? Press `l` (or `dex debug`),
-  open an app, try to drag its title bar and press its buttons, close DeX, and open an issue
-  with the `debug-*.log.filtered` and `.dumpsys` files from `~/.config/dex`
+- **Apps open as windows without any title bar (can't move, resize or minimize them)**: that is
+  One UI 8.5/9 on scrcpy's virtual display (WM Shell logs "desktop not supported" for it). Use
+  the overlay display: `dex doctor` must say `display mode: overlay`; menu `o` sets it. Keep the
+  mouse mode `uhid` (`m`) so the title bars get real mouse events. Still stuck? Press `l` (or
+  `dex debug`), open an app, try to drag its title bar and press its buttons, close DeX, and open
+  an issue with the `debug-*.log.filtered` and `.dumpsys` files from `~/.config/dex`
   (Windows: `%APPDATA%\dex`).
+- **A small picture of the DeX screen floats on the phone**: that is Android's preview of the
+  overlay display. It cannot be hidden; dim the phone (`s`) or put it face down.
 - **Window frozen / unresponsive**: the phone went to sleep or locked. `dex wake` (menu `x`), unlock
   the phone, or press `Alt+Shift+r` in the window. Over Wi-Fi, `dex` already adds a 50 ms video
   buffer and halves the bitrate; on a bad network use 5 GHz, `--res 1600x900`, or USB.
@@ -213,11 +231,9 @@ YouTube, local video files, Plex/Jellyfin and most non-DRM players work fine in 
 `install.sh` / `install.ps1` download the pinned official scrcpy release (it bundles `adb`),
 verify its SHA-256, and install the `dex` wrapper. The wrapper picks the device (USB first, then
 Wi-Fi via mDNS / last known address / the remembered phone), wakes the phone, and starts scrcpy
-with `--new-display=WxH/DPI --flex-display --no-vd-destroy-content --keyboard=uhid --mouse=uhid
---keep-active` plus the profile settings (the UHID mouse is bound to the virtual display, Android
-15+). While scrcpy runs, `dex` watches its log for the new display id and runs
-`wm set-display-windowing-mode -d <id> 5` (freeform) on the phone, which is what One UI 8.5/9
-needs for movable, resizable DeX windows. On One UI 8.5+ it also keeps the "freeform windows"
-developer option off while DeX runs (with it on, window title bars can't be dragged and their
-buttons don't work); set `DEX_FREEFORM_SUPPORT=1` in the config to force it on. See
-[docs/DESIGN.md](docs/DESIGN.md).
+with `--keyboard=uhid --mouse=uhid --keep-active` plus the profile settings (the UHID mouse is
+bound to the mirrored display, Android 15+). On One UI 8.0 it adds `--new-display=WxH/DPI
+--flex-display --no-vd-destroy-content`. On One UI 8.5/9 it first runs `settings put global
+overlay_display_devices WxH/DPI`, waits for the overlay display id, runs `wm
+set-display-windowing-mode -d <id> 5` (freeform) and mirrors it with `--display-id=<id>`; when
+DeX closes it deletes the setting again. See [docs/DESIGN.md](docs/DESIGN.md) for why.
