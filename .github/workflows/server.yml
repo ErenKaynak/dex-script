@@ -1,0 +1,111 @@
+name: Patched scrcpy server
+
+on:
+  workflow_dispatch:
+    inputs:
+      scrcpy_version:
+        description: Upstream scrcpy version (must match the client)
+        required: true
+        default: '5.0.1'
+        type: string
+  push:
+    tags:
+      - 'server-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # dex consumes this release asset through SCRCPY_SERVER_PATH.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.scrcpy_version }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            if [[ "$GITHUB_REF_NAME" =~ ^server-v([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9.-]+)?$ ]]; then
+              version="${BASH_REMATCH[1]}"
+            else
+              echo 'Expected server-vX.Y.Z or server-vX.Y.Z-dexN' >&2
+              exit 1
+            fi
+          else
+            version="$INPUT_VERSION"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download and patch upstream source
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/Genymobile/scrcpy/archive/refs/tags/v${VERSION}.tar.gz" \
+            --output "$RUNNER_TEMP/scrcpy.tar.gz"
+          mkdir -p "$RUNNER_TEMP/scrcpy-source"
+          tar -xzf "$RUNNER_TEMP/scrcpy.tar.gz" \
+            --strip-components=1 -C "$RUNNER_TEMP/scrcpy-source"
+          cd "$RUNNER_TEMP/scrcpy-source"
+          patch --batch --forward --fuzz=0 -p1 \
+            < "$GITHUB_WORKSPACE/server/0001-allows-content-mode-switch.patch"
+
+      - name: Prepare Android SDK
+        run: |
+          : "${ANDROID_HOME:?Android SDK is required}"
+          build_tools=''
+          if [[ -d "$ANDROID_HOME/build-tools" ]]; then
+            build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d \
+            -printf '%f\n' | sort -V | tail -n 1)"
+          fi
+          if [[ ! -f "$ANDROID_HOME/platforms/android-36/android.jar" || -z "$build_tools" ]]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+              'platforms;android-36' 'build-tools;36.0.0' < <(yes)
+            build_tools=36.0.0
+          fi
+          test -x "$ANDROID_HOME/build-tools/$build_tools/aidl"
+          test -x "$ANDROID_HOME/build-tools/$build_tools/d8"
+          echo "ANDROID_BUILD_TOOLS=$build_tools" >> "$GITHUB_ENV"
+
+      - name: Build server
+        run: |
+          cd "$RUNNER_TEMP/scrcpy-source/server"
+          BUILD_DIR="$PWD/out" ANDROID_PLATFORM=36 \
+            ANDROID_BUILD_TOOLS="$ANDROID_BUILD_TOOLS" ./build_without_gradle.sh
+          mkdir -p "$GITHUB_WORKSPACE/server-artifacts"
+          cp out/scrcpy-server "$GITHUB_WORKSPACE/server-artifacts/"
+
+      - name: Verify and checksum server
+        working-directory: server-artifacts
+        run: |
+          test -s scrcpy-server
+          python3 -m zipfile -l scrcpy-server
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('scrcpy-server') as archive:
+              assert archive.getinfo('classes.dex').file_size > 0
+          PY
+          sha256sum scrcpy-server > scrcpy-server.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-server-${{ steps.version.outputs.value }}
+          path: |
+            server-artifacts/scrcpy-server
+            server-artifacts/scrcpy-server.sha256
+          if-no-files-found: error
+
+      - name: Publish server release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Patched scrcpy server ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: |
+            server-artifacts/scrcpy-server
+            server-artifacts/scrcpy-server.sha256

@@ -18,8 +18,9 @@ $script:savedFf = ''; $script:savedBri = ''; $script:savedBriMode = ''; $script:
 $script:tuiSeen = ''; $script:tuiModel = ''; $script:tuiMsg = @('', 'DarkGray'); $script:scrcpyVer = ''
 $script:menuBottom = 0; $script:col = 0; $script:frameW = 80
 $script:savedDesktop = ''; $script:debugLog = ''; $script:logcatProcess = $null
+$script:overlayId = ''
 $script:adbExit = 0
-$script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Mouse = ''; Debug = $false; Raw = @() }
+$script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Mouse = ''; Display = ''; Debug = $false; Raw = @() }
 # Box drawing and marks need a UTF-8 console; fall back to ASCII otherwise.
 $utf8 = $false
 try { $utf8 = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { Write-Verbose 'No console encoding.' }
@@ -102,6 +103,12 @@ Options (start commands):
   --screen-off       same as --screen off
   --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
   --no-freeform      skip the One UI 8.5+/9 windowing fix
+  --display auto|overlay|virtual
+                     overlay (default on One UI 8.5+/9): DeX runs on a system overlay
+                     display, the only kind Android 16 QPR2+/17 gives real desktop windows
+                     (title bars, drag, resize, minimize). Android shows a small preview of
+                     it on the phone screen. virtual: scrcpy's own display (resizes with the
+                     window, but on One UI 8.5+/9 apps have no title bars).
   --mouse uhid|sdk   uhid (default on Android 15+): real HID mouse on the DeX display,
                      DeX title bars drag like with a plugged-in mouse (Alt releases the
                      PC pointer). sdk: injected touch-style clicks, pointer not captured.
@@ -114,7 +121,8 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 
 Config: {CONFIG}
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
-  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, default: 0 on One UI 8.5+), DEX_MOUSE (uhid|sdk),
+  DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
+  DEX_DISPLAY (auto|overlay|virtual), DEX_MOUSE (uhid|sdk),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 '@
@@ -315,18 +323,17 @@ function Invoke-DimOn {
     Invoke-Phone @('settings', 'put', 'system', 'screen_brightness', '0') | Out-Null
     Write-Host 'Phone screen dimmed (restored when DeX closes).' -ForegroundColor DarkGray
 }
-# The "Enable freeform windows" developer option (global enable_freeform_support), set for the
-# session and restored on exit. One UI 8.0 builds may need it on. On One UI 8.5+/9 it is kept
-# off: with it on, the DeX title bar's drag and close/minimize/maximize buttons did nothing in a
-# field test, while sam1am/localdex gets draggable windows on One UI 9 with the option untouched.
+# The freeform developer option is restored on exit. Leave it untouched on One UI 8.5+/9
+# unless explicitly configured; older builds may need it enabled.
 function Get-WantedFreeformSupport {
     $v = Get-Cfg 'DEX_FREEFORM_SUPPORT'
     if ($v -in @('0', '1')) { return $v }
     $v = Get-PhoneValue @('getprop', 'ro.build.version.oneui')
-    if ($v -match '^\d+$' -and [int]$v -ge 80500) { return '0' }
+    if ($v -match '^\d+$' -and [int]$v -ge 80500) { return '' }
     return '1'
 }
 function Invoke-FreeformSupport([string]$Value) {
+    if (!$Value) { return }
     $script:savedFf = ''
     $v = Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')
     if ($v -notmatch '^(null|\d+)$' -or $v -eq $Value) { return } # unreadable, or already right
@@ -345,6 +352,39 @@ function Get-WantedMouse {
     if ($sdk -match '^\d+$' -and [int]$sdk -ge 35) { return 'uhid' }
     return 'sdk'
 }
+function Get-WantedDisplay {
+    $value = $script:opt.Display
+    if (!$value) { $value = Get-Cfg 'DEX_DISPLAY' }
+    if ($value -in @('overlay', 'virtual')) { return $value }
+    $ui = Get-PhoneValue @('getprop', 'ro.build.version.oneui')
+    if ($ui -match '^\d+$') {
+        if ([int]$ui -ge 80500) { return 'overlay' }
+        return 'virtual'
+    }
+    $sdk = Get-PhoneValue @('getprop', 'ro.build.version.sdk')
+    if ($sdk -match '^\d+$' -and [int]$sdk -ge 37) { return 'overlay' }
+    return 'virtual'
+}
+# System overlay displays receive desktop decorations on One UI 8.5+/9.
+function Invoke-OverlayCreate([string]$Resolution, [string]$Dpi) {
+    Invoke-Phone @('settings', 'put', 'global', 'overlay_display_devices', "$Resolution/$Dpi") | Out-Null
+    for ($i = 0; $i -lt 40; $i++) {
+        foreach ($line in @(Invoke-Phone @('dumpsys', 'display'))) {
+            if ($line -match 'type OVERLAY' -and $line -match 'displayId (\d+),') {
+                $script:overlayId = $Matches[1]
+                return $true
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    Invoke-Phone @('settings', 'delete', 'global', 'overlay_display_devices') | Out-Null
+    return $false
+}
+function Invoke-OverlayDestroy {
+    if (!$script:overlayId) { return }
+    Invoke-Phone @('settings', 'delete', 'global', 'overlay_display_devices') | Out-Null
+    $script:overlayId = ''
+}
 function Invoke-ForceDesktop {
     if ((Get-Cfg 'DEX_FORCE_DESKTOP') -ne '1') { return }
     $value = Get-PhoneValue @('settings', 'get', 'global', 'force_desktop_mode_on_external_displays')
@@ -360,6 +400,7 @@ function Invoke-PhoneRestore {
     elseif ($script:savedFf) { Invoke-Phone @('settings', 'put', 'global', 'enable_freeform_support', $script:savedFf) | Out-Null }
     if ($script:savedDesktop -eq 'null') { Invoke-Phone @('settings', 'delete', 'global', 'force_desktop_mode_on_external_displays') | Out-Null }
     elseif ($script:savedDesktop) { Invoke-Phone @('settings', 'put', 'global', 'force_desktop_mode_on_external_displays', $script:savedDesktop) | Out-Null }
+    Invoke-OverlayDestroy
     $script:savedDesktop = ''
     $script:savedBri = ''; $script:savedBriMode = ''; $script:savedFf = ''
 }
@@ -421,6 +462,10 @@ function Invoke-DebugStart([string[]]$ScrcpyArgs) {
         "phone: $(Get-PhoneValue @('getprop', 'ro.product.model')) One UI $(Get-PhoneValue @('getprop', 'ro.build.version.oneui')) SDK $(Get-PhoneValue @('getprop', 'ro.build.version.sdk'))"
         "settings: freeform_support=$(Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')) force_desktop=$(Get-PhoneValue @('settings', 'get', 'global', 'force_desktop_mode_on_external_displays'))"
     ) | Set-Content -LiteralPath $script:debugLog -Encoding UTF8
+    if ($script:overlayId) {
+        Add-Content -LiteralPath "$($script:debugLog).dumpsys" -Value "==== dumpsys window displays (overlay display $($script:overlayId), before scrcpy) ====" -Encoding UTF8
+        Invoke-Phone @('dumpsys', 'window', 'displays') | Add-Content -LiteralPath "$($script:debugLog).dumpsys" -Encoding UTF8
+    }
     Invoke-Adb -Arguments @('-s', $script:serial, 'logcat', '-c') -NoThrow | Out-Null
     $script:logcatProcess = Start-Process -FilePath $script:adb -ArgumentList @('-s', $script:serial, 'logcat', '-v', 'threadtime', '*:D') -NoNewWindow -PassThru -RedirectStandardOutput "$($script:debugLog).logcat" -RedirectStandardError "$($script:debugLog).stderr"
     Write-Host "Debug log: $($script:debugLog) (open an app, drag its title bar, press its buttons, then close DeX)" -ForegroundColor Yellow
@@ -493,9 +538,13 @@ function Invoke-DexStart([string]$Kind) {
     $watch = ($freeform -ne '0' -and $Kind -ne 'mirror') # mirror has no virtual display to fix
 
     $mouse = Get-WantedMouse
+    $display = 'virtual'
+    if ($Kind -ne 'mirror') { $display = Get-WantedDisplay }
     $scrcpyArgs = @('-s', $script:serial)
     if ($Kind -ne 'mirror') {
-        $scrcpyArgs += @("--new-display=$res/$dpi", '--flex-display', '--no-vd-destroy-content', '--keyboard=uhid', "--mouse=$mouse", '--mouse-bind=++++:bhsn')
+        if ($display -eq 'overlay') { $scrcpyArgs += '--display-id=OVERLAY' }
+        else { $scrcpyArgs += @("--new-display=$res/$dpi", '--flex-display', '--no-vd-destroy-content') }
+        $scrcpyArgs += @('--keyboard=uhid', "--mouse=$mouse", '--mouse-bind=++++:bhsn')
     }
     $scrcpyArgs += @("--window-title=Galaxy DeX ($Kind)", "--shortcut-mod=$mod")
     # --keep-active keeps the phone awake on USB and Wi-Fi; --stay-awake only works when plugged in.
@@ -521,8 +570,24 @@ function Invoke-DexStart([string]$Kind) {
     try {
         if ($watch) { Invoke-FreeformSupport (Get-WantedFreeformSupport); Invoke-ForceDesktop }
         if ($screen -eq 'dim') { Invoke-DimOn }
+        if ($display -eq 'overlay') {
+            if (Invoke-OverlayCreate $res $dpi) {
+                Write-Ok "Overlay display $($script:overlayId) created ($res @ $dpi dpi): DeX runs on it like on an external monitor."
+                Write-Host 'Android shows a small preview of it on the phone screen; ignore it. Size is fixed for this session (r = change).' -ForegroundColor DarkGray
+                if ($watch) { Enable-Freeform $script:overlayId }
+                $scrcpyArgs = @($scrcpyArgs | ForEach-Object {
+                    if ($_ -eq '--display-id=OVERLAY') { "--display-id=$($script:overlayId)" } else { $_ }
+                })
+            } else {
+                Write-Warn "Could not create the overlay display; falling back to scrcpy's virtual display (no window title bars on One UI 8.5+)."
+                $display = 'virtual'
+                $scrcpyArgs = @($scrcpyArgs | ForEach-Object {
+                    if ($_ -eq '--display-id=OVERLAY') { "--new-display=$res/$dpi"; '--flex-display'; '--no-vd-destroy-content' } else { $_ }
+                })
+            }
+        }
         if ($script:opt.Debug) { Invoke-DebugStart $scrcpyArgs }
-        Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen, mouse: $mouse)..."
+        Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display)..."
         Write-Host 'Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake' -ForegroundColor DarkGray
         if ($Kind -ne 'mirror' -and $mouse -eq 'uhid') {
             Write-Host 'The DeX window captures the mouse (real HID mouse on the phone). Press Alt to give it back to the PC, click the window to capture again.' -ForegroundColor DarkGray
@@ -652,7 +717,10 @@ function Invoke-Doctor {
     $wk = Get-Wakefulness
     if ($wk) { Write-Host "power:   $wk" }
     $ffs = Get-PhoneValue @('settings', 'get', 'global', 'enable_freeform_support')
-    Write-Host "freeform support: $ffs (dex sets it to $(Get-WantedFreeformSupport) while DeX runs)"
+    $wantedFf = Get-WantedFreeformSupport
+    if (!$wantedFf) { $wantedFf = '<unchanged>' }
+    Write-Host "freeform support: $ffs (dex sets it to $wantedFf while DeX runs)"
+    Write-Host "display mode:     $(Get-WantedDisplay) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
     Write-Host "force desktop:    $(Get-PhoneValue @('settings', 'get', 'global', 'force_desktop_mode_on_external_displays')) (DEX_FORCE_DESKTOP=$(Get-Cfg 'DEX_FORCE_DESKTOP'))"
     Write-Host "mouse mode:       $(Get-WantedMouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
     $remembered = Get-RememberedPhone
@@ -835,7 +903,9 @@ function Show-Menu {
     Write-BoxKv 'Phone' $phone.Text $phone.Color $phone.Batt
     $mouse = Get-Cfg 'DEX_MOUSE'
     if (!$mouse) { $mouse = 'auto' }
-    Write-BoxKv 'Settings' "phone $screen $dot $mode $dot mouse $mouse $dot $res @ $dpi"
+    $display = Get-Cfg 'DEX_DISPLAY'
+    if (!$display) { $display = 'auto' }
+    Write-BoxKv 'Settings' "phone $screen $dot $mode $dot $display $dot mouse $mouse $dot $res @ $dpi"
     Write-BoxLine $script:bx.ML $script:bx.MR
     Write-BoxItem '1' 'Code' 'crisp text: coding, T3, browser' $mark['code']
     Write-BoxItem '2' 'School' 'more room: Word / Excel side by side' $mark['school']
@@ -850,6 +920,7 @@ function Show-Menu {
     Write-BoxItem 'f' 'Window' 'toggle window / fullscreen start'
     Write-BoxItem 'r' 'Size' 'set window size and DPI'
     Write-BoxItem 'm' 'Mouse' 'real HID mouse (uhid) / injected touch (sdk)'
+    Write-BoxItem 'o' 'Display' 'auto / overlay (One UI 9 windows) / virtual'
     Write-BoxItem 'l' 'Log' 'start Code with a phone log for bug reports'
     Write-BoxItem 'd' 'Doctor' 'versions, devices, One UI check'
     Write-BoxItem 'x' 'Wake' 'unfreeze a stuck DeX window'
@@ -922,6 +993,22 @@ function Invoke-Menu {
                 try { $script:opt.Debug = $true; Invoke-MenuAction { Invoke-DexStart 'code' } }
                 finally { $script:opt.Debug = $previousDebug }
             }
+            'o' {
+                switch (Get-Cfg 'DEX_DISPLAY') {
+                    'overlay' {
+                        Save-ConfigValue 'DEX_DISPLAY' 'virtual'
+                        $script:tuiMsg = @('Display: scrcpy virtual display (resizes with the window; no title bars on One UI 8.5+/9).', 'Yellow')
+                    }
+                    'virtual' {
+                        Save-ConfigValue 'DEX_DISPLAY' ''
+                        $script:tuiMsg = @('Display: auto (overlay on One UI 8.5+/9, virtual otherwise).', 'Green')
+                    }
+                    default {
+                        Save-ConfigValue 'DEX_DISPLAY' 'overlay'
+                        $script:tuiMsg = @('Display: overlay (real desktop windows; fixed size; preview on the phone screen).', 'Green')
+                    }
+                }
+            }
             'm' {
                 if ((Get-Cfg 'DEX_MOUSE') -eq 'sdk') {
                     Save-ConfigValue 'DEX_MOUSE' 'uhid'
@@ -988,6 +1075,7 @@ try {
     $positional = @()
     while ($position -lt $args.Count) {
         $arg = [string]$args[$position]; $position++
+        if ($arg -like '--display=*') { $script:opt.Display = $arg.Substring(10); continue }
         if ($arg -like '--mouse=*') { $script:opt.Mouse = $arg.Substring(8); continue }
         if ($arg -like '--res=*') { $script:opt.Res = $arg.Substring(6); continue }
         if ($arg -like '--dpi=*') { $script:opt.Dpi = $arg.Substring(6); continue }
@@ -998,6 +1086,7 @@ try {
             '--dpi' { if ($position -ge $args.Count) { throw '--dpi needs a number.' }; $script:opt.Dpi = [string]$args[$position]; $position++ }
             '--screen' { if ($position -ge $args.Count) { throw '--screen needs on, dim or off.' }; $script:opt.Screen = [string]$args[$position]; $position++ }
             '--mouse' { if ($position -ge $args.Count) { throw '--mouse needs uhid or sdk' }; $script:opt.Mouse = [string]$args[$position]; $position++ }
+            '--display' { if ($position -ge $args.Count) { throw '--display needs auto, overlay or virtual' }; $script:opt.Display = [string]$args[$position]; $position++ }
             '--debug' { $script:opt.Debug = $true }
             '--usb' { $script:opt.Mode = 'usb' }
             '--wifi' { $script:opt.Mode = 'wifi' }
@@ -1016,6 +1105,8 @@ try {
     if ($script:opt.Dpi -and $script:opt.Dpi -notmatch '^[1-9]\d*$') { throw '--dpi must be a positive number.' }
     if ($script:opt.Screen -notin @('', 'on', 'dim', 'off')) { throw '--screen must be on, dim or off.' }
     if ($script:opt.Mouse -notin @('', 'uhid', 'sdk')) { throw '--mouse must be uhid or sdk' }
+    if ($script:opt.Display -notin @('', 'auto', 'overlay', 'virtual')) { throw '--display must be auto, overlay or virtual' }
+    if ($script:opt.Display -eq 'auto') { $script:opt.Display = '' }
     if (!$command) { $command = if (Test-Interactive) { 'menu' } else { 'code' } }
     $rc = 0
     switch ($command) {
