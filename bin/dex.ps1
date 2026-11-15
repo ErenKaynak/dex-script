@@ -932,11 +932,11 @@ function Invoke-Gui {
         $button.Size = New-Object System.Drawing.Size(396, 32)
         if ($item[0] -in @('code', 'school', 'movie', 'mirror')) { $button.Font = $boldFont }
         $button.Add_Click({
-            param($sender, $eventArgs)
+            param($src, $evt)
             # The event arguments are required by the WinForms delegate signature.
-            [void]$eventArgs
+            [void]$evt
             try {
-                switch ([string]$sender.Tag) {
+                switch ([string]$src.Tag) {
                     'screen' {
                         $next = switch (Get-Cfg 'DEX_SCREEN') { 'dim' { 'off' }; 'off' { 'on' }; default { 'dim' } }
                         Save-ConfigValue 'DEX_SCREEN' $next
@@ -947,7 +947,7 @@ function Invoke-Gui {
                         Save-ConfigValue 'DEX_FULLSCREEN' $next
                         Sync-GuiStatus
                     }
-                    default { Invoke-GuiAction ([string]$sender.Tag) }
+                    default { Invoke-GuiAction ([string]$src.Tag) }
                 }
             } catch { Show-GuiMessage $_.Exception.Message -Failure }
         })
