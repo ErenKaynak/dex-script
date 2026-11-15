@@ -538,7 +538,7 @@ cmd_update() {
     exec bash "$DEX_SOURCE_DIR/install.sh"
   fi
   command -v curl >/dev/null 2>&1 || die "Need curl to update."
-  curl -fsSL "https://raw.githubusercontent.com/$DEX_REPO/main/install.sh" | bash
+  curl -fsSL "https://raw.githubusercontent.com/$DEX_REPO/${DEX_BRANCH:-main}/install.sh" | bash
 }
 
 cmd_uninstall() {

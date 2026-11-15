@@ -497,7 +497,7 @@ function Invoke-Update {
         $downloaded = $true
     }
     try {
-        if ($downloaded) { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$repo/main/install.ps1" -OutFile $installer }
+        if ($downloaded) { Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/$repo/$(if ($env:DEX_BRANCH) { $env:DEX_BRANCH } else { 'main' })/install.ps1" -OutFile $installer }
         $global:LASTEXITCODE = 0
         & $installer
         if ($LASTEXITCODE -ne 0) { throw 'The installer failed.' }

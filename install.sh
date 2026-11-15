@@ -6,7 +6,8 @@ set -euo pipefail
 
 main() {
   local repo="${DEX_REPO:-ErenKaynak/dex-script}"
-  local raw="https://raw.githubusercontent.com/$repo/main"
+  local branch="${DEX_BRANCH:-main}"
+  local raw="https://raw.githubusercontent.com/$repo/$branch"
   local ver="${DEX_SCRCPY_VERSION:-5.0.1}"
   local root="${DEX_HOME:-$HOME/.local/share/dex}"
   local bindir="$HOME/.local/bin"

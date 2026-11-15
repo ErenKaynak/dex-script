@@ -13,7 +13,8 @@ try {
     $root = if ($env:DEX_HOME) { $env:DEX_HOME } else { Join-Path $env:LOCALAPPDATA 'dex' }
     $bin = Join-Path $root 'bin'
     $scrcpy = Join-Path $root 'scrcpy'
-    $raw = "https://raw.githubusercontent.com/$repo/main"
+    $branch = if ($env:DEX_BRANCH) { $env:DEX_BRANCH } else { 'main' }
+    $raw = "https://raw.githubusercontent.com/$repo/$branch"
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
     $versionFile = Join-Path $scrcpy 'VERSION'
     if (!(Test-Path $versionFile) -or (Get-Content $versionFile -Raw).Trim() -ne $version) {
