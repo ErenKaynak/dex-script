@@ -51,6 +51,34 @@ try {
             Set-Content -LiteralPath $versionFile -Value $version -Encoding ASCII
         } finally { Remove-Item -LiteralPath $temp -Recurse -Force }
     }
+    # Optional patched server: missing releases must not prevent installing the CLI.
+    $serverTag = if ($env:DEX_SERVER_TAG) { $env:DEX_SERVER_TAG } else { "server-v$version-dex1" }
+    $serverBase = "https://github.com/$repo/releases/download/$serverTag"
+    $serverDestination = Join-Path $scrcpy 'scrcpy-server-dex'
+    $serverMarker = Join-Path $scrcpy 'SERVER_TAG'
+    if ((Test-Path -LiteralPath $serverDestination -PathType Leaf) -and (Test-Path -LiteralPath $serverMarker) -and
+        ([string](Get-Content -LiteralPath $serverMarker -Raw)).Trim() -eq $serverTag) {
+        Write-Host "Patched scrcpy server ($serverTag) already installed"
+    } else {
+        $serverTemp = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        try {
+            New-Item -ItemType Directory -Path $serverTemp | Out-Null
+            $serverFile = Join-Path $serverTemp 'scrcpy-server'
+            $serverSum = Join-Path $serverTemp 'scrcpy-server.sha256'
+            Invoke-WebRequest -UseBasicParsing "$serverBase/scrcpy-server" -OutFile $serverFile
+            Invoke-WebRequest -UseBasicParsing "$serverBase/scrcpy-server.sha256" -OutFile $serverSum
+            $serverExpected = (([string](Get-Content -LiteralPath $serverSum -Raw)).Trim() -split '\s+')[0]
+            if ($serverExpected -match '^[a-fA-F0-9]{64}$' -and (Get-FileHash -LiteralPath $serverFile -Algorithm SHA256).Hash -eq $serverExpected) {
+                Move-Item -LiteralPath $serverFile -Destination $serverDestination -Force
+                Set-Content -LiteralPath $serverMarker -Value $serverTag -Encoding ASCII
+                Write-Host "Installed the patched scrcpy server ($serverTag): real DeX windows on the resizable virtual display (Android 17+)"
+            } else {
+                Write-Warning 'Patched scrcpy server: SHA256 mismatch, not installed (dex uses the stock server / overlay display).'
+            }
+        } catch {
+            Write-Warning "Patched scrcpy server ($serverTag) not available yet; dex uses the stock server (overlay display on One UI 8.5+/9)."
+        } finally { if (Test-Path -LiteralPath $serverTemp) { Remove-Item -LiteralPath $serverTemp -Recurse -Force } }
+    }
     foreach ($name in @('dex.ps1', 'dex.cmd')) {
         $target = Join-Path $bin $name
         if ($env:DEX_SOURCE_DIR) {

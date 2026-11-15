@@ -6,6 +6,8 @@ $script:configDir = if ($env:DEX_CONFIG_DIR) { $env:DEX_CONFIG_DIR } else { Join
 $script:configFile = Join-Path $script:configDir 'config'
 $script:adb = if ($env:DEX_ADB) { $env:DEX_ADB } else { Join-Path $script:root 'scrcpy/adb.exe' }
 $script:scrcpy = if ($env:DEX_SCRCPY) { $env:DEX_SCRCPY } else { Join-Path $script:root 'scrcpy/scrcpy.exe' }
+$script:serverPatched = if ($env:DEX_SERVER_PATCHED) { $env:DEX_SERVER_PATCHED } else { Join-Path $script:root 'scrcpy/scrcpy-server-dex' }
+$script:serverMode = 'stock'
 $script:config = @{}
 if (Test-Path $script:configFile) {
     foreach ($line in Get-Content $script:configFile) {
@@ -20,7 +22,7 @@ $script:menuBottom = 0; $script:col = 0; $script:frameW = 80
 $script:savedDesktop = ''; $script:debugLog = ''; $script:logcatProcess = $null
 $script:overlayId = ''
 $script:adbExit = 0
-$script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Mouse = ''; Display = ''; Debug = $false; Raw = @() }
+$script:opt = @{ Mode = 'auto'; Res = ''; Dpi = ''; Screen = ''; Fullscreen = ''; Freeform = ''; Mouse = ''; Display = ''; Server = ''; Debug = $false; Raw = @() }
 # Box drawing and marks need a UTF-8 console; fall back to ASCII otherwise.
 $utf8 = $false
 try { $utf8 = ([Console]::OutputEncoding.CodePage -eq 65001) } catch { Write-Verbose 'No console encoding.' }
@@ -104,11 +106,17 @@ Options (start commands):
   --fullscreen       start fullscreen at your monitor's resolution (native DeX feel)
   --no-freeform      skip the One UI 8.5+/9 windowing fix
   --display auto|overlay|virtual
-                     overlay (default on One UI 8.5+/9): DeX runs on a system overlay
-                     display, the only kind Android 16 QPR2+/17 gives real desktop windows
-                     (title bars, drag, resize, minimize). Android shows a small preview of
-                     it on the phone screen. virtual: scrcpy's own display (resizes with the
-                     window, but on One UI 8.5+/9 apps have no title bars).
+                     overlay (default on One UI 8.5+/9 with the stock server): DeX runs on a
+                     system overlay display, the only kind Android 16 QPR2+/17 gives real
+                     desktop windows (title bars, drag, resize, minimize) with the stock
+                     scrcpy server. Android shows a small preview of it on the phone screen.
+                     virtual: scrcpy's own display (resizes with the window; on One UI
+                     8.5+/9 it only gets title bars with the patched server).
+  --server auto|patched|stock
+                     patched (default when installed and Android 17+): dex's build of the
+                     scrcpy server that creates the virtual display as desktop-capable
+                     (scrcpy PR #7055), so --display virtual gets real windows and still
+                     resizes with the window. stock: the server from the scrcpy release.
   --mouse uhid|sdk   uhid (default on Android 15+): real HID mouse on the DeX display,
                      DeX title bars drag like with a plugged-in mouse (Alt releases the
                      PC pointer). sdk: injected touch-style clicks, pointer not captured.
@@ -122,7 +130,7 @@ panel off; on some Galaxy phones DeX then stops responding -> run: dex wake
 Config: {CONFIG}
   DEX_SCREEN, DEX_FULLSCREEN, DEX_RES, DEX_DPI, DEX_SHORTCUT_MOD, DEX_EXTRA_ARGS,
   DEX_FREEFORM, DEX_FREEFORM_SUPPORT (0|1, unset = leave the phone's value alone),
-  DEX_DISPLAY (auto|overlay|virtual), DEX_MOUSE (uhid|sdk),
+  DEX_DISPLAY (auto|overlay|virtual), DEX_SERVER (auto|patched|stock), DEX_MOUSE (uhid|sdk),
   DEX_FORCE_DESKTOP (1 = also set force_desktop_mode_on_external_displays while DeX runs),
   DEX_LAST_ENDPOINT, DEX_LAST_IP, DEX_PHONE_NAME, DEX_PHONE_SERIAL (remembered phone)
 '@
@@ -352,10 +360,26 @@ function Get-WantedMouse {
     if ($sdk -match '^\d+$' -and [int]$sdk -ge 35) { return 'uhid' }
     return 'sdk'
 }
+# The patched server creates desktop-capable virtual displays on Android 17+.
+function Get-WantedServer {
+    $value = $script:opt.Server
+    if (!$value) { $value = Get-Cfg 'DEX_SERVER' }
+    if ($value -eq 'stock') { return 'stock' }
+    if ($value -eq 'patched') {
+        if (Test-Path -LiteralPath $script:serverPatched -PathType Leaf) { return 'patched' }
+        Write-Warn "Patched server not installed ($($script:serverPatched)): run dex update. Using the stock server."
+        return 'stock'
+    }
+    if (!(Test-Path -LiteralPath $script:serverPatched -PathType Leaf)) { return 'stock' }
+    $sdk = Get-PhoneValue @('getprop', 'ro.build.version.sdk')
+    if ($sdk -match '^\d+$' -and [int]$sdk -ge 37) { return 'patched' }
+    return 'stock'
+}
 function Get-WantedDisplay {
     $value = $script:opt.Display
     if (!$value) { $value = Get-Cfg 'DEX_DISPLAY' }
     if ($value -in @('overlay', 'virtual')) { return $value }
+    if ($script:serverMode -eq 'patched') { return 'virtual' }
     $ui = Get-PhoneValue @('getprop', 'ro.build.version.oneui')
     if ($ui -match '^\d+$') {
         if ([int]$ui -ge 80500) { return 'overlay' }
@@ -538,8 +562,12 @@ function Invoke-DexStart([string]$Kind) {
     $watch = ($freeform -ne '0' -and $Kind -ne 'mirror') # mirror has no virtual display to fix
 
     $mouse = Get-WantedMouse
+    $script:serverMode = 'stock'
     $display = 'virtual'
-    if ($Kind -ne 'mirror') { $display = Get-WantedDisplay }
+    if ($Kind -ne 'mirror') {
+        $script:serverMode = Get-WantedServer
+        $display = Get-WantedDisplay
+    }
     $scrcpyArgs = @('-s', $script:serial)
     if ($Kind -ne 'mirror') {
         if ($display -eq 'overlay') { $scrcpyArgs += '--display-id=OVERLAY' }
@@ -562,7 +590,13 @@ function Invoke-DexStart([string]$Kind) {
         }
     }
     $scrcpyArgs += @($script:opt.Raw)
-    if ($env:DEX_DRY_RUN -eq '1') { Write-Host ('scrcpy ' + ($scrcpyArgs -join ' ')); return 0 }
+    if ($script:serverMode -eq 'patched') { $env:SCRCPY_SERVER_PATH = $script:serverPatched }
+    else { Remove-Item Env:SCRCPY_SERVER_PATH -ErrorAction SilentlyContinue }
+    if ($env:DEX_DRY_RUN -eq '1') {
+        $prefix = if ($script:serverMode -eq 'patched') { "SCRCPY_SERVER_PATH=$($script:serverPatched) " } else { '' }
+        Write-Host ($prefix + 'scrcpy ' + ($scrcpyArgs -join ' '))
+        return 0
+    }
 
     Save-ConfigValue 'DEX_LAST_PROFILE' $Kind
     Save-PhoneIdentity
@@ -587,7 +621,7 @@ function Invoke-DexStart([string]$Kind) {
             }
         }
         if ($script:opt.Debug) { Invoke-DebugStart $scrcpyArgs }
-        Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display)..."
+        Write-Host "Starting Galaxy DeX ($Kind, $($script:transport), $res @ $dpi dpi, screen: $screen, mouse: $mouse, display: $display, server: $($script:serverMode))..."
         Write-Host 'Resize the window freely. F11 = fullscreen, Alt+q quits. Frozen? Run: dex wake' -ForegroundColor DarkGray
         if ($Kind -ne 'mirror' -and $mouse -eq 'uhid') {
             Write-Host 'The DeX window captures the mouse (real HID mouse on the phone). Press Alt to give it back to the PC, click the window to capture again.' -ForegroundColor DarkGray
@@ -720,6 +754,9 @@ function Invoke-Doctor {
     $wantedFf = Get-WantedFreeformSupport
     if (!$wantedFf) { $wantedFf = '<unchanged>' }
     Write-Host "freeform support: $ffs (dex sets it to $wantedFf while DeX runs)"
+    $script:serverMode = Get-WantedServer
+    $missing = if (Test-Path -LiteralPath $script:serverPatched -PathType Leaf) { '' } else { ' MISSING' }
+    Write-Host "server:           $($script:serverMode) (patched = dex build with desktop-capable virtual display; file: $($script:serverPatched)$missing)"
     Write-Host "display mode:     $(Get-WantedDisplay) (overlay = real desktop windows on One UI 8.5+/9; virtual = scrcpy display)"
     Write-Host "force desktop:    $(Get-PhoneValue @('settings', 'get', 'global', 'force_desktop_mode_on_external_displays')) (DEX_FORCE_DESKTOP=$(Get-Cfg 'DEX_FORCE_DESKTOP'))"
     Write-Host "mouse mode:       $(Get-WantedMouse) (uhid = real HID mouse on the DeX display, needs Android 15+; sdk = injected touch)"
@@ -905,7 +942,9 @@ function Show-Menu {
     if (!$mouse) { $mouse = 'auto' }
     $display = Get-Cfg 'DEX_DISPLAY'
     if (!$display) { $display = 'auto' }
-    Write-BoxKv 'Settings' "phone $screen $dot $mode $dot $display $dot mouse $mouse $dot $res @ $dpi"
+    $server = Get-Cfg 'DEX_SERVER'
+    if (!$server) { $server = 'auto' }
+    Write-BoxKv 'Settings' "phone $screen $dot $mode $dot $display $dot server $server $dot mouse $mouse $dot $res @ $dpi"
     Write-BoxLine $script:bx.ML $script:bx.MR
     Write-BoxItem '1' 'Code' 'crisp text: coding, T3, browser' $mark['code']
     Write-BoxItem '2' 'School' 'more room: Word / Excel side by side' $mark['school']
@@ -921,6 +960,7 @@ function Show-Menu {
     Write-BoxItem 'r' 'Size' 'set window size and DPI'
     Write-BoxItem 'm' 'Mouse' 'real HID mouse (uhid) / injected touch (sdk)'
     Write-BoxItem 'o' 'Display' 'auto / overlay (One UI 9 windows) / virtual'
+    Write-BoxItem 'v' 'Server' 'auto / patched (dex build) / stock scrcpy'
     Write-BoxItem 'l' 'Log' 'start Code with a phone log for bug reports'
     Write-BoxItem 'd' 'Doctor' 'versions, devices, One UI check'
     Write-BoxItem 'x' 'Wake' 'unfreeze a stuck DeX window'
@@ -1009,6 +1049,24 @@ function Invoke-Menu {
                     }
                 }
             }
+            'v' {
+                switch (Get-Cfg 'DEX_SERVER') {
+                    'patched' {
+                        Save-ConfigValue 'DEX_SERVER' 'stock'
+                        $script:tuiMsg = @('Server: stock scrcpy server (virtual display has no title bars on One UI 8.5+/9; overlay mode works).', 'Yellow')
+                    }
+                    'stock' {
+                        Save-ConfigValue 'DEX_SERVER' ''
+                        $script:tuiMsg = @('Server: auto (patched when installed and Android 17+).', 'Green')
+                    }
+                    default {
+                        if (Test-Path -LiteralPath $script:serverPatched -PathType Leaf) {
+                            Save-ConfigValue 'DEX_SERVER' 'patched'
+                            $script:tuiMsg = @('Server: patched (desktop-capable virtual display: real windows, resizes with the window, no phone preview).', 'Green')
+                        } else { $script:tuiMsg = @('Patched server not installed yet: press u (update) first.', 'Red') }
+                    }
+                }
+            }
             'm' {
                 if ((Get-Cfg 'DEX_MOUSE') -eq 'sdk') {
                     Save-ConfigValue 'DEX_MOUSE' 'uhid'
@@ -1075,6 +1133,7 @@ try {
     $positional = @()
     while ($position -lt $args.Count) {
         $arg = [string]$args[$position]; $position++
+        if ($arg -like '--server=*') { $script:opt.Server = $arg.Substring(9); continue }
         if ($arg -like '--display=*') { $script:opt.Display = $arg.Substring(10); continue }
         if ($arg -like '--mouse=*') { $script:opt.Mouse = $arg.Substring(8); continue }
         if ($arg -like '--res=*') { $script:opt.Res = $arg.Substring(6); continue }
@@ -1087,6 +1146,7 @@ try {
             '--screen' { if ($position -ge $args.Count) { throw '--screen needs on, dim or off.' }; $script:opt.Screen = [string]$args[$position]; $position++ }
             '--mouse' { if ($position -ge $args.Count) { throw '--mouse needs uhid or sdk' }; $script:opt.Mouse = [string]$args[$position]; $position++ }
             '--display' { if ($position -ge $args.Count) { throw '--display needs auto, overlay or virtual' }; $script:opt.Display = [string]$args[$position]; $position++ }
+            '--server' { if ($position -ge $args.Count) { throw '--server needs auto, patched or stock' }; $script:opt.Server = [string]$args[$position]; $position++ }
             '--debug' { $script:opt.Debug = $true }
             '--usb' { $script:opt.Mode = 'usb' }
             '--wifi' { $script:opt.Mode = 'wifi' }
@@ -1106,6 +1166,8 @@ try {
     if ($script:opt.Screen -notin @('', 'on', 'dim', 'off')) { throw '--screen must be on, dim or off.' }
     if ($script:opt.Mouse -notin @('', 'uhid', 'sdk')) { throw '--mouse must be uhid or sdk' }
     if ($script:opt.Display -notin @('', 'auto', 'overlay', 'virtual')) { throw '--display must be auto, overlay or virtual' }
+    if ($script:opt.Server -notin @('', 'auto', 'patched', 'stock')) { throw '--server must be auto, patched or stock' }
+    if ($script:opt.Server -eq 'auto') { $script:opt.Server = '' }
     if ($script:opt.Display -eq 'auto') { $script:opt.Display = '' }
     if (!$command) { $command = if (Test-Interactive) { 'menu' } else { 'code' } }
     $rc = 0
